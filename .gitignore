@@ -16,3 +16,4 @@ __pycache__/
 # Логи и временные папки
 filestorage/
 logs/
+google_credentials.json
