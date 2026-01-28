@@ -6,8 +6,8 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# 3. УСТАНОВКА СИСТЕМНЫХ БИБЛИОТЕК (Фикс для OpenCV)
-# Мы добавляем libglib, libsm, libxext и librender — это "глаза" для OpenCV
+# 3. УСТАНОВКА СИСТЕМНЫХ БИБЛИОТЕК
+# FIX: Заменили libgl1-mesa-glx на libgl1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
@@ -15,7 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libxrender-dev \
-    libgl1-mesa-glx \
+    libgl1 \
+    libxcb1 \
+    libx11-xcb1 \
+    libxi6 \
     && rm -rf /var/lib/apt/lists/*
 
 # 4. Python зависимости
