@@ -1,0 +1,32 @@
+name: Deploy to Production
+
+# Триггер: запускать только когда пушим в ветку main
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script: |
+            # 1. Переходим в папку проекта (ПРОВЕРЬ ПУТЬ!)
+            cd /opt/lawbot 
+            
+            # 2. Жестко обновляем код (сбрасываем локальные изменения, если были)
+            git fetch origin main
+            git reset --hard origin/main
+            
+            # 3. Пересобираем и перезапускаем контейнер
+            # (Docker подтянет изменения из Dockerfile, если они были)
+            docker-compose up -d --build
+            
+            # 4. Чистим мусор (старые образы), чтобы диск не забился
+            docker system prune -f
