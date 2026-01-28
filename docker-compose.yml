@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  lawbot:
+    build: .
+    container_name: lawbot_app
+    restart: always
+    ports:
+      - "8000:8000"  # Пробрасываем порт 8000 наружу, чтобы Nginx его видел
+    env_file:
+      - .env         # Читаем секреты из файла .env
+    volumes:
+      # Важно: пробрасываем базу данных наружу, чтобы она не стерлась при обновлении контейнера
+      - ./database.db:/app/database.db
+      # Если вдруг решим хранить файлы локально или логи
+      - ./logs:/app/logs
