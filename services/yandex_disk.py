@@ -1,71 +1,52 @@
 import os
-import io
-import yadisk
-from dotenv import load_dotenv
+import requests
+import logging
 
-load_dotenv()
+# Настройка логгера
+logger = logging.getLogger(__name__)
 
-# Подключаемся к Яндексу
-y = yadisk.YaDisk(token=os.getenv("YANDEX_TOKEN"))
+YANDEX_DISK_TOKEN = os.getenv("YANDEX_DISK_TOKEN")
 
-# Папка в корне Диска, куда будем всё складывать
-ROOT_FOLDER = "/LAW_BOT_DOCS"
-
-def init_yandex():
-    """Проверяет токен и создает корневую папку"""
-    try:
-        if y.check_token():
-            if not y.exists(ROOT_FOLDER):
-                y.mkdir(ROOT_FOLDER)
-            print("--- Яндекс.Диск подключен успешно ---")
-            return True
-        else:
-            print("--- ОШИБКА: Токен Яндекс.Диска неверный ---")
-            return False
-    except Exception as e:
-        print(f"Ошибка подключения к Яндексу: {e}")
-        return False
-
-def upload_to_yandex(file_bytes, filename, client_name):
-    """
-    1. Создает папку клиента.
-    2. Загружает файл.
-    3. Делает файл публичным и возвращает ссылку.
-    """
-    try:
-        # 1. Готовим пути
-        safe_client_name = "".join([c for c in client_name if c.isalnum() or c.isspace()]).strip()
-        client_folder = f"{ROOT_FOLDER}/{safe_client_name}"
-        
-        # Создаем папку клиента, если нет
-        if not y.exists(client_folder):
-            y.mkdir(client_folder)
-            
-        # Полный путь к файлу в облаке
-        remote_path = f"{client_folder}/{filename}"
-        
-        # Если файл с таким именем есть - добавим цифру (чтобы не перезатереть)
-        if y.exists(remote_path):
-            import time
-            timestamp = int(time.time())
-            remote_path = f"{client_folder}/{timestamp}_{filename}"
-
-        # 2. Загружаем (из памяти, не создавая временный файл на диске)
-        y.upload(io.BytesIO(file_bytes), remote_path)
-        
-        # 3. Публикуем (создаем красивую ссылку)
-        # Если нужна приватность - закомментируй этот блок, но тогда бот не пришлет ссылку
-        y.publish(remote_path)
-        meta = y.get_meta(remote_path)
-        public_link = meta.public_url
-        
-        print(f"Загружено на Яндекс: {public_link}")
-        return public_link
-
-    except Exception as e:
-        print(f"Ошибка Яндекс.Диска: {e}")
+def get_upload_link(path):
+    """Получает ссылку для загрузки файла"""
+    url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
+    headers = {"Authorization": f"OAuth {YANDEX_DISK_TOKEN}"}
+    params = {"path": path, "overwrite": "true"}
+    
+    response = requests.get(url, headers=headers, params=params)
+    if response.status_code == 200:
+        return response.json().get("href")
+    else:
+        logger.error(f"Error getting upload link: {response.text}")
         return None
 
-# Запускаем проверку при старте файла (для теста)
-if __name__ == "__main__":
-    init_yandex()
+def upload_file_to_disk(local_path, remote_path):
+    """Основная функция загрузки"""
+    if not YANDEX_DISK_TOKEN:
+        logger.error("Yandex Disk Token is missing!")
+        return False
+
+    try:
+        # 1. Получаем ссылку для загрузки
+        # (Для MVP мы пока не создаем папки рекурсивно, надеемся что Яндекс умный или папка есть.
+        # Если будет ошибка 'DiskNotFoundError', добавим функцию создания папок).
+        upload_link = get_upload_link(remote_path)
+        
+        if not upload_link:
+            logger.error(f"Failed to get upload link for {remote_path}")
+            return False
+
+        # 2. Загружаем файл
+        with open(local_path, "rb") as f:
+            response = requests.put(upload_link, files={"file": f})
+            
+        if response.status_code == 201:
+            logger.info(f"File uploaded successfully to {remote_path}")
+            return True
+        else:
+            logger.error(f"Upload failed with status: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Exception during upload: {e}")
+        return False
