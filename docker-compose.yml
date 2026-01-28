@@ -6,7 +6,7 @@ services:
     container_name: lawbot_app
     restart: always
     ports:
-      - "8001:8000"  # Пробрасываем порт 8000 наружу, чтобы Nginx его видел
+      - "8001:8000"  # Пробрасываем порт 8001 наружу, чтобы Nginx его видел
     env_file:
       - .env         # Читаем секреты из файла .env
     volumes:
