@@ -124,7 +124,8 @@ class DocumentProcessor:
                     "status": "success", 
                     "doc_type": doc_type, 
                     "person": person_name,
-                    "filename": final_filename
+                    "filename": final_filename,
+                    "remote_path": remote_path  # <--- ДОБАВИЛИ ЭТУ СТРОКУ
                 }
             else:
                 return {"status": "error", "message": "Ошибка загрузки на Диск"}
