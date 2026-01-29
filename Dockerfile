@@ -7,7 +7,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 # 3. УСТАНОВКА СИСТЕМНЫХ БИБЛИОТЕК
-# FIX: Заменили libgl1-mesa-glx на libgl1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
@@ -19,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb1 \
     libx11-xcb1 \
     libxi6 \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # 4. Python зависимости

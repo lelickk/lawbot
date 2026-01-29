@@ -1,96 +1,87 @@
 import os
 import requests
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 def create_folder(path, token):
-    """Создает одну папку. Если она есть (409) - не ругается."""
     url = "https://cloud-api.yandex.net/v1/disk/resources"
     headers = {"Authorization": f"OAuth {token}"}
-    params = {"path": path}
-    
-    response = requests.put(url, headers=headers, params=params)
-    
-    if response.status_code == 201:
-        logger.info(f"Created folder: {path}")
-        return True
-    elif response.status_code == 409:
-        # Папка уже есть - это нормально
-        return True
-    else:
-        logger.error(f"Error creating folder {path}: {response.text}")
-        return False
+    requests.put(url, headers=headers, params={"path": path})
 
 def ensure_folder_structure(full_path, token):
-    """
-    Рекурсивно создает структуру папок.
-    Принимает полный путь к файлу (например /Clients/Phone/Doc.jpg)
-    И создает /Clients -> /Clients/Phone
-    """
-    # Отсекаем имя файла, оставляем только путь к папке
     folder_path = os.path.dirname(full_path)
-    
-    if not folder_path or folder_path == "/":
-        return True
-
-    # Разбиваем путь на кусочки (['Clients', '+972...', '_Originals_'])
+    if not folder_path or folder_path == "/": return True
     parts = folder_path.strip("/").split("/")
-    
     current_path = ""
     for part in parts:
         current_path += "/" + part
-        # Создаем текущий уровень
-        if not create_folder(current_path, token):
-            return False
-            
+        create_folder(current_path, token)
     return True
 
+def check_file_exists(path, token):
+    """Проверяет, существует ли файл"""
+    url = "https://cloud-api.yandex.net/v1/disk/resources"
+    headers = {"Authorization": f"OAuth {token}"}
+    params = {"path": path}
+    response = requests.get(url, headers=headers, params=params)
+    return response.status_code == 200
+
+def get_unique_path(path, token):
+    """
+    Если файл 'Doc.jpg' существует, превращает путь в 'Doc_1.jpg', 'Doc_2.jpg' и т.д.
+    """
+    if not check_file_exists(path, token):
+        return path
+    
+    # Файл существует, начинаем подбирать имя
+    folder = os.path.dirname(path)
+    filename = os.path.basename(path)
+    name, ext = os.path.splitext(filename)
+    
+    counter = 1
+    while True:
+        # Добавляем дату и счетчик, чтобы точно не совпало
+        # Или просто счетчик
+        date_str = datetime.now().strftime("%Y%m%d")
+        new_filename = f"{name}_{date_str}_{counter}{ext}"
+        new_path = f"{folder}/{new_filename}"
+        
+        if not check_file_exists(new_path, token):
+            return new_path
+        counter += 1
+        if counter > 10: # Защита от бесконечного цикла
+            return f"{folder}/{name}_{datetime.now().timestamp()}{ext}"
+
 def get_upload_link(path, token):
-    """Получает ссылку для загрузки файла"""
     url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
     headers = {"Authorization": f"OAuth {token}"}
-    params = {"path": path, "overwrite": "true"}
+    params = {"path": path, "overwrite": "false"} # Важно: false, мы сами контролируем имена
     
     response = requests.get(url, headers=headers, params=params)
     if response.status_code == 200:
         return response.json().get("href")
-    else:
-        logger.error(f"Error getting upload link: {response.text}")
-        return None
+    return None
 
 def upload_file_to_disk(local_path, remote_path):
-    """Основная функция загрузки"""
     token = os.getenv("YANDEX_DISK_TOKEN")
-    
-    if not token:
-        logger.error("Yandex Disk Token is missing! Check .env file.")
-        return False
+    if not token: return False
 
     try:
-        # 1. ГАРАНТИРУЕМ, ЧТО ПАПКИ СУЩЕСТВУЮТ
-        if not ensure_folder_structure(remote_path, token):
-            logger.error("Failed to create folder structure")
-            return False
-
-        # 2. Получаем ссылку
-        upload_link = get_upload_link(remote_path, token)
+        ensure_folder_structure(remote_path, token)
         
-        if not upload_link:
-            logger.error(f"Failed to get upload link for {remote_path}")
-            return False
+        # Генерируем уникальное имя, чтобы не затереть старое
+        final_path = get_unique_path(remote_path, token)
 
-        # 3. Загружаем файл
+        upload_link = get_upload_link(final_path, token)
+        if not upload_link: return False
+
         with open(local_path, "rb") as f:
-            response = requests.put(upload_link, files={"file": f})
+            requests.put(upload_link, files={"file": f})
             
-        if response.status_code == 201:
-            logger.info(f"File uploaded successfully to {remote_path}")
-            return True
-        else:
-            logger.error(f"Upload failed with status: {response.status_code}")
-            return False
-            
+        logger.info(f"File uploaded: {final_path}")
+        return True
     except Exception as e:
-        logger.error(f"Exception during upload: {e}")
+        logger.error(f"Upload error: {e}")
         return False
