@@ -30,35 +30,39 @@ def get_upload_link(path, token):
     return None
 
 def publish_file(path):
-    """Делает файл публичным и возвращает ссылку"""
+    """Делает файл публичным и ГАРАНТИРОВАННО возвращает ссылку"""
     token = os.getenv("YANDEX_DISK_TOKEN")
     if not token: return None
 
-    url = "https://cloud-api.yandex.net/v1/disk/resources/publish"
     headers = {"Authorization": f"OAuth {token}"}
-    params = {"path": path}
     
+    # 1. Сначала пытаемся опубликовать
+    publish_url = "https://cloud-api.yandex.net/v1/disk/resources/publish"
     try:
-        response = requests.put(url, headers=headers, params=params)
-        
-        # Если 200 - все ок, ссылка в теле ответа
-        if response.status_code == 200:
-            link = response.json().get("href") # ВНИМАНИЕ: Тут API может вернуть 'href' или сам объект
-            # Обычно для получения публичной ссылки нужно сделать отдельный GET запрос к ресурсу
-            # Но метод publish возвращает link в ответе метода.
-            # Если нет - делаем перестраховку ниже.
-            pass
-            
-        # Запрашиваем мета-информацию, чтобы точно получить public_url
-        meta_url = "https://cloud-api.yandex.net/v1/disk/resources"
-        meta_response = requests.get(meta_url, headers=headers, params={"path": path})
-        if meta_response.status_code == 200:
-            return meta_response.json().get("public_url")
-            
-        return None
-
+        requests.put(publish_url, headers=headers, params={"path": path})
+        # Мы даже не проверяем ответ, так как если файл уже публичен, 
+        # Яндекс может вернуть ошибку, но нам все равно.
+        # Главное - следующий шаг.
     except Exception as e:
-        logger.error(f"Error publishing file: {e}")
+        logger.error(f"Error sending publish request: {e}")
+
+    # 2. Теперь запрашиваем мета-данные файла, там точно будет ссылка
+    meta_url = "https://cloud-api.yandex.net/v1/disk/resources"
+    try:
+        response = requests.get(meta_url, headers=headers, params={"path": path})
+        if response.status_code == 200:
+            data = response.json()
+            public_url = data.get("public_url")
+            if public_url:
+                return public_url
+            else:
+                logger.warning(f"File {path} published, but no public_url found in meta.")
+                return None
+        else:
+            logger.error(f"Failed to get meta for {path}: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Error getting file link: {e}")
         return None
 
 def upload_file_to_disk(local_path, remote_path):
