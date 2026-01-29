@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 app = FastAPI()
 
-# --- 1. НАСТРОЙКА БЕЗОПАСНОСТИ АДМИНКИ ---
+# --- 1. НАСТРОЙКА БЕЗОПАСНОСТИ АДМИНКИ (DEBUG MODE) ---
 class AdminAuth(AuthenticationBackend):
     async def login(self, request: StarletteRequest) -> bool:
         form = await request.form()
@@ -35,17 +35,34 @@ class AdminAuth(AuthenticationBackend):
         stored_user = os.getenv("ADMIN_USERNAME", "admin")
         stored_hash = os.getenv("ADMIN_PASSWORD_HASH")
 
+        # ЛОГИРОВАНИЕ ДЛЯ ОТЛАДКИ (УДАЛИТЬ ПОТОМ)
+        logger.info(f"--- LOGIN ATTEMPT ---")
+        logger.info(f"Input Username: '{username}'")
+        logger.info(f"Stored Username: '{stored_user}'")
+        
         if not stored_hash:
-            logger.warning("ADMIN_PASSWORD_HASH not set in .env! Login disabled.")
+            logger.error("CRITICAL: ADMIN_PASSWORD_HASH is empty in .env!")
             return False
 
         # Хешируем введенный пароль
         input_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
+        
+        logger.info(f"Input Password Hash: {input_hash}")
+        logger.info(f"Stored Password Hash: {stored_hash}")
 
-        # Сравниваем безопасным способом
-        if username == stored_user and hmac.compare_digest(input_hash, stored_hash):
+        # Сравниваем
+        user_match = (username == stored_user)
+        pass_match = hmac.compare_digest(input_hash, stored_hash)
+        
+        logger.info(f"Username Match: {user_match}")
+        logger.info(f"Password Match: {pass_match}")
+
+        if user_match and pass_match:
+            logger.info("LOGIN SUCCESS")
             request.session.update({"token": "valid_token"})
             return True
+            
+        logger.warning("LOGIN FAILED")
         return False
 
     async def logout(self, request: StarletteRequest) -> bool:
@@ -54,9 +71,7 @@ class AdminAuth(AuthenticationBackend):
 
     async def authenticate(self, request: StarletteRequest) -> bool:
         token = request.session.get("token")
-        if not token:
-            return False
-        return True
+        return bool(token)
 
 # Инициализация защиты
 authentication_backend = AdminAuth(secret_key=os.getenv("SECRET_KEY", "change_me_please"))
