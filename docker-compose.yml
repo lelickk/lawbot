@@ -7,15 +7,11 @@ services:
     restart: always
     ports:
       - "8001:8000"
-    # Читаем переменные прямо из файла .env и внедряем в контейнер
     env_file:
       - .env
     environment:
       - TZ=Asia/Jerusalem
     volumes:
-      # Важно: пробрасываем базу данных наружу, чтобы она не стерлась при обновлении контейнера
-      - ./database.db:/app/database.db
-      # Если вдруг решим хранить файлы локально или логи
-      - ./logs:/app/logs
       - ./temp_files:/app/temp_files
-      - ./.env:/app/.env  # <--- ДОБАВЬ ЭТУ СТРОКУ (проброс файла с паролями)
+    # ВАЖНО: Явно указываем команду с тайм-аутом 300 секунд (5 минут)
+    command: gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --timeout 300 main:app
