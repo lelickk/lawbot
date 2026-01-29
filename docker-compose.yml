@@ -11,7 +11,10 @@ services:
       - .env
     environment:
       - TZ=Asia/Jerusalem
+      # Указываем, что база лежит в папке data
+      - DATABASE_URL=sqlite:////data/lawbot.db
     volumes:
       - ./temp_files:/app/temp_files
-    # ВАЖНО: Явно указываем команду с тайм-аутом 300 секунд (5 минут)
+      # !!! ВАЖНО: Сохраняем базу на хосте
+      - ./lawbot_data:/data
     command: gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --timeout 300 main:app

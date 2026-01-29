@@ -9,12 +9,29 @@ from dotenv import load_dotenv
 from sqlmodel import Session, select
 from database import init_db, engine, Client, Document
 
+# --- НОВЫЕ ИМПОРТЫ ДЛЯ АДМИНКИ ---
+from sqladmin import Admin, ModelView
+
 # --- НАСТРОЙКА ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 app = FastAPI()
+
+# --- НАСТРОЙКА АДМИНКИ ---
+# Доступна по адресу /admin
+admin = Admin(app, engine)
+
+class ClientAdmin(ModelView, model=Client):
+    column_list = [Client.id, Client.phone_number, Client.full_name, Client.created_at]
+
+class DocumentAdmin(ModelView, model=Document):
+    column_list = [Document.id, Document.client_id, Document.doc_type, Document.file_path, Document.created_at]
+
+admin.add_view(ClientAdmin)
+admin.add_view(DocumentAdmin)
+# -----------------------------
 
 # Инициализация Twilio
 twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
@@ -39,18 +56,21 @@ REQUIRED_DOCS = {
     "Справка_об_отсутствии_судимости"
 }
 
-# --- ФУНКЦИИ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def send_whatsapp_message(to_number, body_text):
     """Отправляет сообщение пользователю через API"""
     try:
-        # Для Sandbox номер фиксированный. Для продакшена лучше вынести в .env
+        # Для Sandbox номер фиксированный. Для продакшена замените на свой.
         from_number = 'whatsapp:+14155238886' 
+        
+        # Нормализация номера
+        to = f"whatsapp:{to_number}" if not to_number.startswith("whatsapp:") else to_number
         
         message = twilio_client.messages.create(
             from_=from_number,
             body=body_text,
-            to=f"whatsapp:{to_number}" if not to_number.startswith("whatsapp:") else to_number
+            to=to
         )
         logger.info(f"Message sent to {to_number}: {message.sid}")
     except Exception as e:
@@ -74,7 +94,7 @@ def process_file_task(user_phone, media_url, media_type):
             with open(local_path, 'wb') as f:
                 f.write(requests.get(media_url).content)
             
-            # 2. Обрабатываем
+            # 2. Обрабатываем (Поворот -> PDF -> AI -> Yandex)
             result = processor.process_and_upload(user_phone, local_path, filename)
             
             if result["status"] == "success":
@@ -105,10 +125,10 @@ def process_file_task(user_phone, media_url, media_type):
                 session.add(new_doc)
                 session.commit()
                 
-                # 5. Ссылка (теперь надежно)
+                # 5. Публикуем ссылку
                 public_link = publish_file(remote_path)
                 
-                # 6. Отчет
+                # 6. Отчет о комплекте
                 docs_stmt = select(Document).where(Document.client_id == client.id)
                 existing_docs = session.exec(docs_stmt).all()
                 uploaded_types = {d.doc_type for d in existing_docs}
@@ -116,14 +136,12 @@ def process_file_task(user_phone, media_url, media_type):
                 
                 msg = f"✅ Сохранено: {doc_type}\n"
                 if doc_type == "Другое":
-                     msg += "⚠️ (Тип не распознан, но файл сохранен)\n"
+                     msg += "⚠️ (Тип не распознан)\n"
                 
                 msg += f"👤 Досье: {client.full_name}\n"
                 
                 if public_link:
                     msg += f"🔗 Ссылка: {public_link}\n"
-                else:
-                    msg += "🔗 (Ссылка пока недоступна)\n"
                 
                 if missing:
                     msg += f"\n❌ Осталось сдать:\n- " + "\n- ".join(missing)
@@ -137,9 +155,8 @@ def process_file_task(user_phone, media_url, media_type):
                 
         except Exception as e:
             logger.error(f"Background task failed: {e}")
-            send_whatsapp_message(user_phone, "❌ Системная ошибка.")
+            send_whatsapp_message(user_phone, "❌ Системная ошибка при обработке.")
         finally:
-            # Чистим временный файл скачивания
             if os.path.exists(local_path):
                 os.remove(local_path)
 
@@ -147,7 +164,7 @@ def process_file_task(user_phone, media_url, media_type):
 
 @app.post("/whatsapp")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Вебхук только принимает сигнал и запускает задачи"""
+    """Вебхук принимает запрос и сразу отвечает OK, работу шлет в фон"""
     form_data = await request.form()
     
     sender = form_data.get("From", "") 
@@ -166,7 +183,7 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
 
     # СЦЕНАРИЙ 2: КОМАНДА СТАТУС
     elif body_text in ["статус", "status", "отчет", "docs", "1"]:
-        # Обрабатываем синхронно, но ответ шлем через API, чтобы было надежно
+        # Статус формируем тут же, но шлем через API для надежности
         with Session(engine) as session:
             statement = select(Client).where(Client.phone_number == user_phone)
             client = session.exec(statement).first()
@@ -181,8 +198,6 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
                 
                 report = f"📂 Досье: {client.full_name}\n"
                 report += f"📥 Всего файлов: {len(existing_docs)}\n"
-                
-                # Добавляем список сданного (для наглядности)
                 if uploaded_types:
                     report += "✅ Сдано: " + ", ".join(uploaded_types) + "\n"
 

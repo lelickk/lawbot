@@ -4,6 +4,7 @@ import logging
 import base64
 import img2pdf
 from datetime import datetime
+from PIL import Image, ImageOps # Для поворота фото
 from pdf2image import convert_from_path
 from services.yandex_disk import upload_file_to_disk
 from services.openai_client import analyze_document
@@ -28,11 +29,22 @@ class DocumentProcessor:
             return None
 
     def _convert_jpg_to_pdf(self, jpg_path):
-        """Конвертирует JPG в PDF для архива"""
+        """Конвертирует JPG в PDF с АВТО-ПОВОРОТОМ (EXIF)"""
         try:
+            # 1. Открываем картинку через PIL
+            image = Image.open(jpg_path)
+            
+            # 2. Исправляем ориентацию (если телефон сохранил боком)
+            image = ImageOps.exif_transpose(image)
+            
+            # 3. Сохраняем обратно (перезаписываем)
+            image.save(jpg_path)
+            
+            # 4. Конвертируем в PDF
             pdf_path = os.path.splitext(jpg_path)[0] + ".pdf"
             with open(pdf_path, "wb") as f:
                 f.write(img2pdf.convert(jpg_path))
+            
             return pdf_path
         except Exception as e:
             logger.error(f"Error converting JPG to PDF: {e}")
@@ -50,13 +62,13 @@ class DocumentProcessor:
         is_pdf_input = local_path.lower().endswith(".pdf")
 
         try:
-            # 1. ПОДГОТОВКА (Все пути должны быть определены)
+            # 1. ПОДГОТОВКА ФАЙЛОВ
             if is_pdf_input:
                 # PDF -> JPG для анализа, Оригинал для загрузки
                 ai_input_path = self._convert_pdf_to_jpg(local_path)
                 final_upload_path = local_path 
             else:
-                # JPG -> Оригинал для анализа, PDF для загрузки
+                # JPG -> Оригинал для анализа, PDF для загрузки (с поворотом)
                 ai_input_path = local_path
                 final_upload_path = self._convert_jpg_to_pdf(local_path)
 
@@ -64,7 +76,7 @@ class DocumentProcessor:
                 raise Exception("Failed to prepare image for AI analysis")
             
             if not final_upload_path:
-                # Если конвертация сломалась, пробуем загрузить оригинал как fallback
+                # Fallback: если конвертация упала, грузим оригинал
                 logger.warning("PDF conversion failed, uploading original image")
                 final_upload_path = local_path
 
@@ -73,6 +85,7 @@ class DocumentProcessor:
             try:
                 base64_img = self._encode_image(ai_input_path)
                 
+                # Полный список документов
                 prompt = """
                 Проанализируй документ. 
                 1. Тип документа. ВЫБЕРИ СТРОГО ИЗ СПИСКА: 
@@ -87,7 +100,7 @@ class DocumentProcessor:
             except Exception as e:
                 logger.error(f"AI Analysis failed: {e}")
 
-            # 3. ИМЯ ФАЙЛА
+            # 3. ФОРМИРОВАНИЕ ПУТЕЙ
             person_name = doc_data.get('person_name', 'Client').strip()
             safe_person_name = "".join(c for c in person_name if c.isalnum() or c in (' ', '_', '-')).strip()
             if not safe_person_name: safe_person_name = "Client"
@@ -97,20 +110,17 @@ class DocumentProcessor:
             
             remote_folder = f"/Clients/{user_phone}/{safe_person_name}"
             
-            # --- ЖЕСТКОЕ ПРИСВОЕНИЕ .pdf ---
-            # Даже если это JPG, мы его сконвертировали выше, поэтому имя .pdf
+            # Всегда сохраняем как .pdf (если это не оригинал)
             final_filename = f"{date_str}_{doc_type}.pdf"
             
             remote_path = f"{remote_folder}/{final_filename}"
-            
-            # Оригинал
             original_remote_path = f"/Clients/{user_phone}/_Originals_/{date_str}_{original_filename}"
 
             # 4. ЗАГРУЗКА
             # Оригинал
             upload_file_to_disk(local_path, original_remote_path)
             
-            # Финальный файл
+            # Чистовой файл
             success = upload_file_to_disk(final_upload_path, remote_path)
 
             # Чистка
@@ -125,7 +135,7 @@ class DocumentProcessor:
                     "doc_type": doc_type, 
                     "person": person_name,
                     "filename": final_filename,
-                    "remote_path": remote_path  # <--- ДОБАВИЛИ ЭТУ СТРОКУ
+                    "remote_path": remote_path # ВАЖНО для создания ссылки
                 }
             else:
                 return {"status": "error", "message": "Ошибка загрузки на Диск"}
