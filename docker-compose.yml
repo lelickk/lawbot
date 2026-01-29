@@ -10,6 +10,8 @@ services:
     # Читаем переменные прямо из файла .env и внедряем в контейнер
     env_file:
       - .env
+    environment:
+      - TZ=Asia/Jerusalem
     volumes:
       # Важно: пробрасываем базу данных наружу, чтобы она не стерлась при обновлении контейнера
       - ./database.db:/app/database.db
