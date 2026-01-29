@@ -1,15 +1,18 @@
 import os
 import requests
+from dotenv import load_dotenv # Сначала импорт dotenv
+
+# СРАЗУ загружаем переменные, до всего остального
+load_dotenv()
+
 from fastapi import FastAPI, Request, Form
 from twilio.twiml.messaging_response import MessagingResponse
 from services.doc_processor import DocumentProcessor
-from dotenv import load_dotenv
-
-# Загрузка переменных окружения
-load_dotenv()
 
 app = FastAPI()
 processor = DocumentProcessor()
+
+# ... дальше весь остальной код без изменений ...
 
 @app.post("/whatsapp")
 async def whatsapp_webhook(request: Request):
