@@ -15,12 +15,17 @@ jobs:
           OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
           TWILIO_SID: ${{ secrets.TWILIO_SID }}
           TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+          # --- НОВЫЕ ПЕРЕМЕННЫЕ ---
+          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+          ADMIN_PASSWORD_HASH: ${{ secrets.ADMIN_PASSWORD_HASH }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
         with:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
           port: 22
-          envs: YANDEX_TOKEN,OPENAI_KEY,TWILIO_SID,TWILIO_TOKEN
+          # --- ДОБАВЛЯЕМ ИХ В СПИСОК ПЕРЕДАЧИ ---
+          envs: YANDEX_TOKEN,OPENAI_KEY,TWILIO_SID,TWILIO_TOKEN,ADMIN_USERNAME,ADMIN_PASSWORD_HASH,SECRET_KEY
           script: |
             cd /opt/lawbot
             
@@ -29,6 +34,11 @@ jobs:
             echo "OPENAI_API_KEY=$OPENAI_KEY" >> .env
             echo "TWILIO_ACCOUNT_SID=$TWILIO_SID" >> .env
             echo "TWILIO_AUTH_TOKEN=$TWILIO_TOKEN" >> .env
+            
+            # --- ЗАПИСЫВАЕМ НОВЫЕ СЕКРЕТЫ ---
+            echo "ADMIN_USERNAME=$ADMIN_USERNAME" >> .env
+            echo "ADMIN_PASSWORD_HASH=$ADMIN_PASSWORD_HASH" >> .env
+            echo "SECRET_KEY=$SECRET_KEY" >> .env
             
             # 2. Обновляем код из Гита
             git fetch origin main
