@@ -40,7 +40,7 @@
 
 ### 1. Клонирование и зависимости
 ```bash
-git clone [https://github.com/ВАШ_НИК/LawBot.git](https://github.com/ВАШ_НИК/LawBot.git)
+git clone https://github.com/lelickk/LawBot.git
 cd LawBot
 
 python -m venv venv
