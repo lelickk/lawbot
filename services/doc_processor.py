@@ -6,6 +6,7 @@ import base64
 from pdf2image import convert_from_path
 from services.yandex_disk import upload_file_to_disk
 from services.openai_client import analyze_document
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ class DocumentProcessor:
 
     def process_and_upload(self, user_phone, local_path, original_filename):
         try:
-            # 1. Подготовка файла для ИИ (PDF -> JPG)
+            # 1. Подготовка (PDF -> JPG для ИИ)
             ai_input_path = local_path
             if local_path.lower().endswith(".pdf"):
                 converted_jpg = self._convert_pdf_to_jpg(local_path)
@@ -73,71 +74,73 @@ class DocumentProcessor:
                     logger.warning("Could not convert PDF, skipping AI analysis")
                     ai_input_path = None
 
-            # 2. Спрашиваем ИИ (только если есть картинка)
-            doc_data = {"doc_type": "Нераспознанный", "person_name": "Неизвестный"}
+            # 2. Анализ ИИ
+            doc_data = {"doc_type": "Document", "person_name": "Unknown"}
             
             if ai_input_path:
                 try:
-                    # Можно попробовать улучшить картинку перед отправкой
-                    # enhanced_path = self._enhance_image(ai_input_path) 
-                    # Но для PDF конвертации часто достаточно
-                    
                     base64_img = self._encode_image(ai_input_path)
                     
+                    # Промпт уже настроен на JSON
                     prompt = """
                     Проанализируй документ. 
-                    1. Определи тип документа (Теудат Зеут, Водительские права, Справка, Счет, Неизвестно).
-                    2. Найди имя и фамилию человека (на иврите или английском). Если нет - напиши 'Неизвестный'.
+                    1. Тип документа. ВЫБЕРИ СТРОГО ИЗ СПИСКА: 
+                       [Теудат_Зеут, Водительские_Права, Чек, Справка, Тлуш_Маскорет, Другое].
+                       Если не уверен - пиши 'Другое'.
+                    2. Найди Имя и Фамилию (на латинице, транслитерация).
                     Верни JSON: {"doc_type": "...", "person_name": "..."}
                     """
-                    
                     ai_result = analyze_document(base64_img, prompt)
                     if ai_result:
                         doc_data = ai_result
-                        
                 except Exception as e:
                     logger.error(f"AI Analysis failed: {e}")
 
-            # 3. Формируем красивое имя
-            # Очищаем имя от лишних символов для файла
-            safe_name = "".join(c for c in doc_data['person_name'] if c.isalnum() or c in (' ', '_', '-')).strip()
-            if not safe_name: safe_name = "Client"
+            # 3. ФОРМИРОВАНИЕ ИМЕНИ (ИСПРАВЛЕНО)
+            # Очистка имени человека для папки
+            person_name = doc_data.get('person_name', 'Client').strip()
+            safe_person_name = "".join(c for c in person_name if c.isalnum() or c in (' ', '_', '-')).strip()
+            if not safe_person_name: safe_person_name = "Client"
             
-            doc_type = doc_data.get('doc_type', 'Doc')
+            # Тип документа для файла
+            doc_type = doc_data.get('doc_type', 'Doc').replace(" ", "_")
             
-            # Имя файла: 2026-01-29_TeudatZehut.jpg (дата добавляется в yandex_disk.py или тут)
-            # В MVP мы делали это при загрузке.
+            # Дата для файла (YYYY-MM-DD)
+            date_str = datetime.now().strftime("%Y-%m-%d")
             
-            # Структура папок: /Clients/PHONE/NAME/
-            remote_folder = f"/Clients/{user_phone}/{safe_name}"
+            # Папка: /Clients/+97250.../Ivan_Ivanov/
+            remote_folder = f"/Clients/{user_phone}/{safe_person_name}"
             
-            # Имя файла для сохранения
-            ext = os.path.splitext(original_filename)[1]
-            final_filename = f"{doc_type}{ext}"
+            # Имя файла: 2026-01-29_Teudat_Zehut.pdf
+            ext = os.path.splitext(original_filename)[1] # .pdf или .jpg
+            final_filename = f"{date_str}_{doc_type}{ext}"
             
             remote_path = f"{remote_folder}/{final_filename}"
-            original_path = f"/Clients/{user_phone}/_Originals_/{original_filename}"
+            
+            # Оригиналы кладем отдельно, чтобы не потерять исходное имя
+            original_path = f"/Clients/{user_phone}/_Originals_/{date_str}_{original_filename}"
 
-            # 4. Загружаем (сначала оригинал, потом красиво названный)
-            # Загружаем оригинал
+            # 4. Загрузка
+            # Сначала оригинал (резервная копия)
             upload_file_to_disk(local_path, original_path)
             
-            # Загружаем переименованный (основной)
+            # Потом красивый файл в папку клиента
             success = upload_file_to_disk(local_path, remote_path)
 
-            # Чистим мусор
+            # Чистка
             if os.path.exists(local_path): os.remove(local_path)
             if ai_input_path and ai_input_path != local_path: os.remove(ai_input_path)
 
             if success:
                 return {
                     "status": "success", 
-                    "doc_type": doc_data['doc_type'], 
-                    "person": doc_data['person_name']
+                    "doc_type": doc_type, 
+                    "person": person_name,
+                    "filename": final_filename
                 }
             else:
                 return {"status": "error", "message": "Ошибка загрузки на Диск"}
 
         except Exception as e:
-            logger.error(f"Critical error in processor: {e}")
+            logger.error(f"Critical error: {e}")
             return {"status": "error", "message": str(e)}
