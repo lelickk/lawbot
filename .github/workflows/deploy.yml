@@ -23,19 +23,24 @@ jobs:
           port: 22
           # Перечисляем переменные для передачи в скрипт
           envs: YANDEX_TOKEN,OPENAI_KEY,TWILIO_SID,TWILIO_TOKEN
-          script: |
+         script: |
             cd /opt/lawbot
             
-            # Заполняем .env полным списком ключей
+            # 1. Записываем секреты (как и было)
             echo "YANDEX_DISK_TOKEN=$YANDEX_TOKEN" > .env
             echo "OPENAI_API_KEY=$OPENAI_KEY" >> .env
-            echo "TWILIO_ACCOUNT_SID=$TWILIO_SID" >> .env   # <--- Добавили
-            echo "TWILIO_AUTH_TOKEN=$TWILIO_TOKEN" >> .env   # <--- Добавили
+            echo "TWILIO_ACCOUNT_SID=$TWILIO_SID" >> .env
+            echo "TWILIO_AUTH_TOKEN=$TWILIO_TOKEN" >> .env
             
-            # Стандартное обновление
+            # 2. Обновляем код
             git fetch origin main
             git reset --hard origin/main
             
-            # Перезапуск
-            docker-compose up -d --build
+            # FIX: Жестко удаляем старый контейнер, чтобы освободить имя
+            docker rm -f lawbot_app || true
+            
+            # 3. Запускаем (добавили флаг --remove-orphans, чтобы почистить мусор)
+            docker-compose up -d --build --remove-orphans
+            
+            # Чистим место
             docker system prune -f
