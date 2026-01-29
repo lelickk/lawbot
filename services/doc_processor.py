@@ -33,14 +33,15 @@ class DocumentProcessor:
         try:
             img = Image.open(image_path)
             
-            # УБРАЛИ МИНУС: Теперь крутим ПРОТИВ часовой стрелки (стандарт PIL)
-            img = img.rotate(angle, expand=True)
+            # СТАВИМ МИНУС ОБРАТНО: Крутим ПО ЧАСОВОЙ (как привычно людям)
+            # Если ИИ скажет 90 -> крутим на -90 (вправо)
+            img = img.rotate(-angle, expand=True)
             
             img.save(image_path)
-            logger.info(f"Image rotated by {angle} degrees (Counter-Clockwise)")
+            logger.info(f"Image rotated by {angle} degrees (Clockwise)")
         except Exception as e:
             logger.error(f"Rotation failed: {e}")
-
+            
     def _convert_jpg_to_pdf(self, jpg_path):
         try:
             # 1. Сначала применяем EXIF (если есть)
