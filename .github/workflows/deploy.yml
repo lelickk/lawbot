@@ -11,36 +11,34 @@ jobs:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         env:
-          # Прокидываем ВСЕ секреты
           YANDEX_TOKEN: ${{ secrets.YANDEX_TOKEN }}
           OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
-          TWILIO_SID: ${{ secrets.TWILIO_SID }}      # <--- Добавили
-          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}  # <--- Добавили
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
         with:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
           port: 22
-          # Перечисляем переменные для передачи в скрипт
           envs: YANDEX_TOKEN,OPENAI_KEY,TWILIO_SID,TWILIO_TOKEN
-         script: |
+          script: |
             cd /opt/lawbot
             
-            # 1. Записываем секреты (как и было)
+            # 1. Записываем секреты в файл .env
             echo "YANDEX_DISK_TOKEN=$YANDEX_TOKEN" > .env
             echo "OPENAI_API_KEY=$OPENAI_KEY" >> .env
             echo "TWILIO_ACCOUNT_SID=$TWILIO_SID" >> .env
             echo "TWILIO_AUTH_TOKEN=$TWILIO_TOKEN" >> .env
             
-            # 2. Обновляем код
+            # 2. Обновляем код из Гита
             git fetch origin main
             git reset --hard origin/main
             
-            # FIX: Жестко удаляем старый контейнер, чтобы освободить имя
+            # 3. Удаляем старый контейнер (чтобы не было конфликта имен)
             docker rm -f lawbot_app || true
             
-            # 3. Запускаем (добавили флаг --remove-orphans, чтобы почистить мусор)
+            # 4. Запускаем
             docker-compose up -d --build --remove-orphans
             
-            # Чистим место
+            # 5. Чистим мусор
             docker system prune -f
