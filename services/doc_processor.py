@@ -18,35 +18,30 @@ class DocumentProcessor:
 
     def _enhance_image(self, file_path):
         """
-        Улучшает качество изображения для OCR:
-        - Переводит в Ч/Б
-        - Убирает шум
-        - Делает 'бинаризацию' (как скан)
+        Улучшает качество изображения для OCR.
         """
         try:
-            # Читаем изображение
             img = cv2.imread(file_path)
             if img is None:
-                return file_path # Если не картинка (pdf), возвращаем как есть
+                return file_path 
 
-            # 1. Перевод в оттенки серого
+            # 1. Ч/Б + Убираем шум
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-            # 2. Убираем шум (Gaussian Blur)
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-            # 3. Адаптивная бинаризация (делает текст черным, фон белым, убирает тени)
             processed = cv2.adaptiveThreshold(
                 blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
             )
+            
+            # ВАЖНО: Конвертируем обратно в 3 канала (RGB), 
+            # иначе OpenAI может выдать ошибку "unsupported image"
+            final_img = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
 
-            # Сохраняем улучшенную версию во временный файл
             enhanced_path = file_path.replace(".", "_enhanced.")
-            cv2.imwrite(enhanced_path, processed)
+            cv2.imwrite(enhanced_path, final_img)
             return enhanced_path
         except Exception as e:
             print(f"Error enhancing image: {e}")
-            return file_path # Если ошибка, возвращаем оригинал
+            return file_path
 
     def _find_existing_folder(self, base_path, target_name):
         """

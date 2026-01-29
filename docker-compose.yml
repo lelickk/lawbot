@@ -14,3 +14,5 @@ services:
       - ./database.db:/app/database.db
       # Если вдруг решим хранить файлы локально или логи
       - ./logs:/app/logs
+      - ./temp_files:/app/temp_files
+      - ./.env:/app/.env  # <--- ДОБАВЬ ЭТУ СТРОКУ (проброс файла с паролями)

@@ -1,6 +1,5 @@
 name: Deploy to Production
 
-# Триггер: запускать только когда пушим в ветку main
 on:
   push:
     branches: [ "main" ]
@@ -16,17 +15,19 @@ jobs:
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
           port: 22
+          # Мы передаем секреты внутрь скрипта через envs
+          envs: YANDEX_TOKEN,OPENAI_KEY
           script: |
-            # 1. Переходим в папку проекта (ПРОВЕРЬ ПУТЬ!)
-            cd /opt/lawbot 
+            cd /opt/lawbot
             
-            # 2. Жестко обновляем код (сбрасываем локальные изменения, если были)
+            # 1. Создаем файл .env на сервере с секретами
+            echo "YANDEX_DISK_TOKEN=$YANDEX_TOKEN" > .env
+            echo "OPENAI_API_KEY=$OPENAI_KEY" >> .env
+            
+            # 2. Обновляем код
             git fetch origin main
             git reset --hard origin/main
             
-            # 3. Пересобираем и перезапускаем контейнер
-            # (Docker подтянет изменения из Dockerfile, если они были)
+            # 3. Перезапускаем
             docker-compose up -d --build
-            
-            # 4. Чистим мусор (старые образы), чтобы диск не забился
             docker system prune -f
