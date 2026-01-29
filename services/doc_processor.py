@@ -4,7 +4,7 @@ import logging
 import base64
 import img2pdf
 from datetime import datetime
-from PIL import Image
+from PIL import Image, ImageOps
 from pdf2image import convert_from_path
 from services.yandex_disk import upload_file_to_disk
 from services.openai_client import analyze_document
@@ -28,21 +28,27 @@ class DocumentProcessor:
             return None
 
     def _rotate_image_by_angle(self, image_path, angle):
-        """Физически поворачивает картинку на заданный угол"""
+        """Физически поворачивает картинку"""
         if angle == 0: return
         try:
-            # Открываем
             img = Image.open(image_path)
-            # Поворачиваем (PIL поворачивает против часовой, поэтому минус)
-            # expand=True чтобы не обрезать края
-            img = img.rotate(-angle, expand=True)
+            
+            # УБРАЛИ МИНУС: Теперь крутим ПРОТИВ часовой стрелки (стандарт PIL)
+            img = img.rotate(angle, expand=True)
+            
             img.save(image_path)
-            logger.info(f"Image rotated by {angle} degrees")
+            logger.info(f"Image rotated by {angle} degrees (Counter-Clockwise)")
         except Exception as e:
             logger.error(f"Rotation failed: {e}")
 
     def _convert_jpg_to_pdf(self, jpg_path):
         try:
+            # 1. Сначала применяем EXIF (если есть)
+            image = Image.open(jpg_path)
+            image = ImageOps.exif_transpose(image)
+            image.save(jpg_path)
+
+            # 2. Конвертируем в PDF
             pdf_path = os.path.splitext(jpg_path)[0] + ".pdf"
             with open(pdf_path, "wb") as f:
                 f.write(img2pdf.convert(jpg_path))
@@ -61,27 +67,27 @@ class DocumentProcessor:
         is_pdf_input = local_path.lower().endswith(".pdf")
 
         try:
-            # 1. ПОДГОТОВКА (Получаем JPG для анализа)
             if is_pdf_input:
                 ai_input_path = self._convert_pdf_to_jpg(local_path)
                 final_upload_path = local_path 
             else:
                 ai_input_path = local_path
-                # PDF пока не делаем, сначала узнаем угол поворота!
+                # PDF пока не делаем, ждем вердикта ИИ по углу
 
             if not ai_input_path: raise Exception("Failed to prepare image")
 
-            # 2. АНАЛИЗ ИИ (С запросом угла)
+            # 2. АНАЛИЗ ИИ
             doc_data = {"doc_type": "Document", "person_name": "Unknown", "rotation": 0}
             try:
                 base64_img = self._encode_image(ai_input_path)
                 
+                # ИЗМЕНИЛИ ПРОМПТ: Просим угол ПРОТИВ часовой стрелки
                 prompt = """
                 Проанализируй документ.
                 1. Тип документа (Теудат_Зеут, Водительские_Права, Чек, Справка, Тлуш_Маскорет, Паспорт, Загранпаспорт, Справка_об_отсутствии_судимости, Другое).
                 2. Имя и Фамилию (латиница).
-                3. Оцени, нужно ли повернуть фото, чтобы текст был горизонтальным (по часовой стрелке).
-                   Варианты: 0 (не нужно), 90, 180, 270.
+                3. Если фото перевернуто, укажи угол поворота ПРОТИВ часовой стрелки (Counter-Clockwise), чтобы текст стал горизонтальным.
+                   Варианты: 0, 90, 180, 270.
                 
                 Верни JSON: {"doc_type": "...", "person_name": "...", "rotation": 0}
                 """
@@ -91,19 +97,19 @@ class DocumentProcessor:
             except Exception as e:
                 logger.error(f"AI Analysis failed: {e}")
 
-            # 3. ПОВОРОТ И КОНВЕРТАЦИЯ
+            # 3. ПОВОРОТ
             rotation_needed = doc_data.get("rotation", 0)
             
             if not is_pdf_input:
-                # Если это картинка, поворачиваем её перед созданием PDF
+                # Поворачиваем картинку, если нужно
                 if rotation_needed in [90, 180, 270]:
                     self._rotate_image_by_angle(local_path, rotation_needed)
                 
-                # Теперь создаем финальный PDF из (возможно повернутой) картинки
+                # Теперь делаем PDF из уже ровной картинки
                 final_upload_path = self._convert_jpg_to_pdf(local_path)
                 if not final_upload_path: final_upload_path = local_path
 
-            # 4. ФОРМИРОВАНИЕ ПУТЕЙ
+            # 4. ПУТИ
             person_name = doc_data.get('person_name', 'Client').strip()
             safe_person_name = "".join(c for c in person_name if c.isalnum() or c in (' ', '_', '-')).strip()
             if not safe_person_name: safe_person_name = "Client"
@@ -120,7 +126,6 @@ class DocumentProcessor:
             upload_file_to_disk(local_path, original_remote_path)
             success = upload_file_to_disk(final_upload_path, remote_path)
 
-            # Чистка
             to_remove = [local_path, ai_input_path, final_upload_path]
             for path in set(to_remove):
                 if path and os.path.exists(path) and "temp_files" in path: os.remove(path)
