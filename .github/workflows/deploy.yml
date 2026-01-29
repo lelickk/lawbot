@@ -10,24 +10,32 @@ jobs:
     steps:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          # Прокидываем ВСЕ секреты
+          YANDEX_TOKEN: ${{ secrets.YANDEX_TOKEN }}
+          OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}      # <--- Добавили
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}  # <--- Добавили
         with:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
           port: 22
-          # Мы передаем секреты внутрь скрипта через envs
-          envs: YANDEX_TOKEN,OPENAI_KEY
+          # Перечисляем переменные для передачи в скрипт
+          envs: YANDEX_TOKEN,OPENAI_KEY,TWILIO_SID,TWILIO_TOKEN
           script: |
             cd /opt/lawbot
             
-            # 1. Создаем файл .env на сервере с секретами
+            # Заполняем .env полным списком ключей
             echo "YANDEX_DISK_TOKEN=$YANDEX_TOKEN" > .env
             echo "OPENAI_API_KEY=$OPENAI_KEY" >> .env
+            echo "TWILIO_ACCOUNT_SID=$TWILIO_SID" >> .env   # <--- Добавили
+            echo "TWILIO_AUTH_TOKEN=$TWILIO_TOKEN" >> .env   # <--- Добавили
             
-            # 2. Обновляем код
+            # Стандартное обновление
             git fetch origin main
             git reset --hard origin/main
             
-            # 3. Перезапускаем
+            # Перезапуск
             docker-compose up -d --build
             docker system prune -f
