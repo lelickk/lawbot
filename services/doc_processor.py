@@ -27,22 +27,50 @@ class DocumentProcessor:
             logger.error(f"Error converting PDF to JPG: {e}")
             return None
 
-    def _rotate_image_by_angle(self, image_path, angle):
-        """Поворот изображения (против часовой стрелки, стандарт PIL)"""
-        if angle == 0: return
+    def _apply_orientation_fix(self, image_path, orientation):
+        """
+        Поворачивает изображение на основе текстового описания ориентации.
+        PIL rotate(90) = Против часовой стрелки.
+        """
+        if orientation == "normal": return
+        
         try:
             img = Image.open(image_path)
-            img = img.rotate(angle, expand=True) 
-            img.save(image_path)
-            logger.info(f"Image rotated by {angle} degrees")
+            angle = 0
+            
+            # Логика поворота (Железобетонная)
+            if orientation == "rotated_left":
+                # Верхушка букв смотрит ВЛЕВО. 
+                # Чтобы поставить ровно, нужно повернуть ПО ЧАСОВОЙ (CW).
+                angle = -90 
+            
+            elif orientation == "rotated_right":
+                # Верхушка букв смотрит ВПРАВО.
+                # Чтобы поставить ровно, нужно повернуть ПРОТИВ ЧАСОВОЙ (CCW).
+                angle = 90
+            
+            elif orientation == "upside_down":
+                # Вверх ногами
+                angle = 180
+                
+            if angle != 0:
+                img = img.rotate(angle, expand=True)
+                img.save(image_path)
+                logger.info(f"Fixed orientation '{orientation}' by rotating {angle} degrees")
+                
         except Exception as e:
             logger.error(f"Rotation failed: {e}")
 
     def _convert_jpg_to_pdf(self, jpg_path):
         try:
             image = Image.open(jpg_path)
-            image = ImageOps.exif_transpose(image)
+            # Убираем exif_transpose, чтобы он не сбивал наш ручной поворот, 
+            # или используем его ДО анализа. Но лучше довериться ИИ.
+            # image = ImageOps.exif_transpose(image) 
+            
+            # Просто пересохраняем, чтобы сбросить EXIF ориентацию, если она была
             image.save(jpg_path)
+            
             pdf_path = os.path.splitext(jpg_path)[0] + ".pdf"
             with open(pdf_path, "wb") as f:
                 f.write(img2pdf.convert(jpg_path))
@@ -69,43 +97,35 @@ class DocumentProcessor:
 
             if not ai_input_path: raise Exception("Failed to prepare image for AI")
 
-            # --- АНАЛИЗ ИИ (Обновленный жесткий промпт) ---
-            doc_data = {"doc_type": "Document", "person_name": "Unknown", "rotation": 0}
+            # --- АНАЛИЗ ИИ (Словесная ориентация) ---
+            doc_data = {
+                "doc_type": "Document", 
+                "person_name": "Unknown", 
+                "text_orientation": "normal"
+            }
+            
             try:
                 base64_img = self._encode_image(ai_input_path)
                 
                 prompt = """
-                You are a strict document analysis system for the Israeli Ministry of Interior.
-                Analyze the image carefully.
-
-                TASK 1: ORIENTATION CHECK (CRITICAL)
-                Look at the text direction (Hebrew or English). 
-                - If the text is upside down, you MUST return 180.
-                - If the text is vertical (pointing left), return 90.
-                - If the text is vertical (pointing right), return 270.
-                - Only return 0 if the text is perfectly horizontal and readable.
+                Analyze this document for Misrad Hapnim (Israeli Ministry of Interior).
+                
+                TASK 1: ORIENTATION (CRITICAL)
+                Look at the text direction. Where is the TOP of the letters pointing?
+                Return "text_orientation" as one of:
+                - "normal" (Text is horizontal and readable)
+                - "upside_down" (Text is upside down)
+                - "rotated_left" (Top of text points to the LEFT side of image)
+                - "rotated_right" (Top of text points to the RIGHT side of image)
                 
                 TASK 2: CLASSIFICATION
-                Classify into ONE category:
-                   - ID_Document (Teudat Zehut)
-                   - Passport (Foreign Passport)
-                   - Photo_ID (Passport photo)
-                   - Marriage_Certificate
-                   - Birth_Certificate
-                   - Police_Clearance (Teudat Yosher)
-                   - Marital_Status_Doc
-                   - Bank_Statement
-                   - Salary_Slip (Tlush Maskoret)
-                   - Rental_Contract
-                   - Utility_Bill
-                   - Relationship_Letter
-                   - Other
-
+                Classify document type (e.g. ID_Document, Passport, Birth_Certificate, Marriage_Certificate, Bank_Statement, Salary_Slip, etc).
+                
                 TASK 3: EXTRACTION
-                Extract the First and Last Name (Latin characters). If the document is upside down, rotate it mentally first!
-
-                OUTPUT JSON ONLY:
-                {"doc_type": "...", "person_name": "...", "rotation": 0}
+                Extract First and Last Name (Latin). If text is rotated, read it mentally.
+                
+                OUTPUT JSON:
+                {"doc_type": "...", "person_name": "...", "text_orientation": "..."}
                 """
                 
                 ai_result = analyze_document(base64_img, prompt)
@@ -114,15 +134,15 @@ class DocumentProcessor:
                 logger.error(f"AI Analysis failed: {e}")
 
             # --- ПОВОРОТ ---
-            rotation_needed = doc_data.get("rotation", 0)
-            if not is_pdf_input and rotation_needed in [90, 180, 270]:
-                self._rotate_image_by_angle(local_path, rotation_needed)
+            orientation = doc_data.get("text_orientation", "normal")
+            if not is_pdf_input and orientation != "normal":
+                self._apply_orientation_fix(local_path, orientation)
             
             if not is_pdf_input:
                 final_upload_path = self._convert_jpg_to_pdf(local_path)
                 if not final_upload_path: final_upload_path = local_path
 
-            # --- ПУТИ И ЗАГРУЗКА ---
+            # --- ЗАГРУЗКА ---
             person_name = doc_data.get('person_name', 'Client').strip()
             safe_person_name = "".join(c for c in person_name if c.isalnum() or c in (' ', '_', '-')).strip()
             if not safe_person_name: safe_person_name = "Client"
@@ -143,8 +163,10 @@ class DocumentProcessor:
 
             if success:
                 return {
-                    "status": "success", "doc_type": doc_type, 
-                    "person": person_name, "filename": final_filename,
+                    "status": "success", 
+                    "doc_type": doc_type, 
+                    "person": person_name, 
+                    "filename": final_filename,
                     "remote_path": remote_path
                 }
             else:
