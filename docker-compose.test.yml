@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  app_test:
+    build: .
+    container_name: lawbot_app_test
+    restart: always
+    ports:
+      - "8002:8000"  # Тест работает на порту 8002
+    env_file:
+      - .env.test    # Читает отдельный файл настроек
+    environment:
+      - TZ=Asia/Jerusalem
+      - DATABASE_URL=sqlite:////data/lawbot_test.db # Отдельная база данных
+    volumes:
+      - ./temp_files:/app/temp_files
+      - ./lawbot_data_test:/data # Отдельная папка для базы
+    command: gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --timeout 300 main:app
