@@ -6,15 +6,13 @@ services:
     container_name: lawbot_app
     restart: always
     ports:
-      - "8001:8000"
+      - "8001:8000"  # <--- ВНЕШНИЙ 8001, ВНУТРЕННИЙ 8000
     env_file:
       - .env
     environment:
       - TZ=Asia/Jerusalem
-      # Указываем, что база лежит в папке data
       - DATABASE_URL=sqlite:////data/lawbot.db
     volumes:
       - ./temp_files:/app/temp_files
-      # !!! ВАЖНО: Сохраняем базу на хосте
       - ./lawbot_data:/data
     command: gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --timeout 300 main:app
