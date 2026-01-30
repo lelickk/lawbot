@@ -3,21 +3,14 @@ import json
 import logging
 from openai import OpenAI
 
-# Настройка логгера
 logger = logging.getLogger(__name__)
 
-# УБИРАЕМ глобальную инициализацию client = ...
-
-def analyze_document(base64_image, prompt_text):
-    """
-    Отправляет картинку в GPT-4o и возвращает JSON с данными.
-    """
+def analyze_document(base64_image, system_prompt):
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        logger.error("OpenAI API Key is missing!")
-        return {"doc_type": "Ошибка настройки", "person_name": "Нет ключа API"}
+        logger.error("OPENAI_API_KEY is missing")
+        return None
 
-    # Инициализируем клиента ТОЛЬКО когда он нужен
     client = OpenAI(api_key=api_key)
 
     try:
@@ -25,13 +18,9 @@ def analyze_document(base64_image, prompt_text):
             model="gpt-4o",
             messages=[
                 {
-                    "role": "system",
-                    "content": "Ты - API, который возвращает ответ строго в формате JSON."
-                },
-                {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": prompt_text},
+                        {"type": "text", "text": system_prompt},
                         {
                             "type": "image_url",
                             "image_url": {
@@ -41,13 +30,36 @@ def analyze_document(base64_image, prompt_text):
                     ],
                 }
             ],
-            response_format={"type": "json_object"},
-            max_tokens=300,
+            max_tokens=1000,
+            temperature=0.0, # Максимальная строгость
         )
 
-        result_text = response.choices[0].message.content
-        return json.loads(result_text)
+        content = response.choices[0].message.content
+        
+        # --- ВАЖНО: Логируем сырой ответ, чтобы видеть ошибки ---
+        logger.info(f"🤖 RAW AI RESPONSE: {content}")
 
+        if not content:
+            logger.error("OpenAI returned empty content")
+            return None
+
+        # --- ЧИСТКА ОТВЕТА ---
+        # 1. Убираем Markdown обертки (```json ... ```)
+        cleaned_content = content.replace("```json", "").replace("```", "").strip()
+        
+        # 2. Если GPT написал вступление, ищем первую скобку {
+        start_index = cleaned_content.find("{")
+        end_index = cleaned_content.rfind("}")
+        
+        if start_index != -1 and end_index != -1:
+            cleaned_content = cleaned_content[start_index : end_index + 1]
+
+        # 3. Парсим
+        return json.loads(cleaned_content)
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON Parsing Error: {e}. Content was: {content}")
+        return None
     except Exception as e:
-        logger.error(f"OpenAI API Error: {e}")
-        return {"doc_type": "Ошибка ИИ", "person_name": "Неизвестный"}
+        logger.error(f"OpenAI General Error: {e}")
+        return None
