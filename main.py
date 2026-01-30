@@ -6,7 +6,7 @@ import hmac
 from fastapi import FastAPI, Request, BackgroundTasks
 from twilio.rest import Client as TwilioClient
 from services.doc_processor import DocumentProcessor
-from services.yandex_disk import publish_file  # <--- ВЕРНУЛИ ИМПОРТ
+from services.yandex_disk import publish_file
 from dotenv import load_dotenv
 from sqlmodel import Session, select
 from database import init_db, engine, Client, Document
@@ -28,7 +28,7 @@ REQUIRED_DOCS = {
     "Recommendation_Letter"
 }
 
-# --- 2. АДМИНКА ---
+# --- 2. АДМИНКА (ИСПРАВЛЕНО: Вернули классы) ---
 class AdminAuth(AuthenticationBackend):
     async def login(self, request: StarletteRequest) -> bool:
         form = await request.form()
@@ -53,8 +53,18 @@ class AdminAuth(AuthenticationBackend):
 
 authentication_backend = AdminAuth(secret_key=os.getenv("SECRET_KEY", "change_me_please"))
 admin = Admin(app, engine, authentication_backend=authentication_backend)
-admin.add_view(ModelView(Client, icon="fa-solid fa-user"))
-admin.add_view(ModelView(Document, icon="fa-solid fa-file"))
+
+# ВАЖНО: Определяем настройки через классы, иначе ошибка TypeError
+class ClientAdmin(ModelView, model=Client):
+    column_list = [Client.id, Client.phone_number, Client.full_name, Client.created_at]
+    icon = "fa-solid fa-user"
+
+class DocumentAdmin(ModelView, model=Document):
+    column_list = [Document.id, Document.client_id, Document.doc_type, Document.file_path, Document.created_at]
+    icon = "fa-solid fa-file"
+
+admin.add_view(ClientAdmin)
+admin.add_view(DocumentAdmin)
 
 # --- 3. СЕРВИСЫ ---
 twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
@@ -83,11 +93,9 @@ def process_file_task(user_phone, media_url, media_type):
             response = requests.get(media_url)
             with open(local_path, 'wb') as f: f.write(response.content)
             
-            # Обработка + Загрузка (Оригинал + PDF)
             result = processor.process_and_upload(user_phone, local_path, filename)
             
             if result["status"] == "success":
-                # Обновляем БД
                 client = session.exec(select(Client).where(Client.phone_number == user_phone)).first()
                 if not client:
                     client = Client(phone_number=user_phone, full_name=result["person"])
@@ -102,10 +110,8 @@ def process_file_task(user_phone, media_url, media_type):
                 session.add(new_doc)
                 session.commit()
                 
-                # <--- ВЕРНУЛИ ГЕНЕРАЦИЮ ССЫЛКИ --->
                 public_link = publish_file(result["remote_path"])
                 
-                # Считаем остаток
                 existing = {d.doc_type for d in session.exec(select(Document).where(Document.client_id == client.id)).all()}
                 missing = REQUIRED_DOCS - existing
                 
