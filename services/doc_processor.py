@@ -20,7 +20,6 @@ class DocumentProcessor:
         try:
             images = convert_from_path(pdf_path)
             if not images: return None
-            # Берем первую страницу для анализа
             jpg_path = pdf_path.replace(".pdf", "_temp_analysis.jpg")
             images[0].save(jpg_path, "JPEG")
             return jpg_path
@@ -29,19 +28,11 @@ class DocumentProcessor:
             return None
 
     def _rotate_image_by_angle(self, image_path, angle):
-        """
-        Физически поворачивает картинку.
-        Убрали минус, чтобы изменить направление поворота.
-        """
+        """Поворот изображения (против часовой стрелки, стандарт PIL)"""
         if angle == 0: return
         try:
             img = Image.open(image_path)
-            
-            # ИСПРАВЛЕНИЕ: Убрали минус. 
-            # Теперь направление поворота соответствует стандартному поведению PIL (против часовой).
-            # Если ИИ скажет "90", повернем на 90.
             img = img.rotate(angle, expand=True) 
-            
             img.save(image_path)
             logger.info(f"Image rotated by {angle} degrees")
         except Exception as e:
@@ -50,9 +41,8 @@ class DocumentProcessor:
     def _convert_jpg_to_pdf(self, jpg_path):
         try:
             image = Image.open(jpg_path)
-            image = ImageOps.exif_transpose(image) # Учитываем ориентацию EXIF
+            image = ImageOps.exif_transpose(image)
             image.save(jpg_path)
-            
             pdf_path = os.path.splitext(jpg_path)[0] + ".pdf"
             with open(pdf_path, "wb") as f:
                 f.write(img2pdf.convert(jpg_path))
@@ -71,7 +61,6 @@ class DocumentProcessor:
         is_pdf_input = local_path.lower().endswith(".pdf")
 
         try:
-            # 1. Подготовка файла для ИИ (если PDF -> JPG)
             if is_pdf_input:
                 ai_input_path = self._convert_pdf_to_jpg(local_path)
                 final_upload_path = local_path 
@@ -80,44 +69,43 @@ class DocumentProcessor:
 
             if not ai_input_path: raise Exception("Failed to prepare image for AI")
 
-            # 2. АНАЛИЗ ИИ (СТУПРО / МВД)
+            # --- АНАЛИЗ ИИ (Обновленный жесткий промпт) ---
             doc_data = {"doc_type": "Document", "person_name": "Unknown", "rotation": 0}
             try:
                 base64_img = self._encode_image(ai_input_path)
                 
-                # Полный список документов для СТуПРО
                 prompt = """
-                Analyze this document for an Israeli Ministry of Interior (Misrad Hapnim) StuPro application.
-                
-                1. Classify the document type into ONE of these categories:
-                   - ID_Document (Teudat Zehut / תעודת זהות)
-                   - Passport (Foreign Passport / דרכון)
-                   - Photo_ID (Passport photo / תמונה חזותית)
-                   - Application_Form (Ash/6, Mar/6, Ash/1, Ash/3 / טפסים ובקשות)
-                   - Marriage_Certificate (תעודת נישואין)
-                   - Birth_Certificate (תעודת לידה)
-                   - Name_Change_Cert (תעודת שינוי שם)
-                   - Marital_Status_Doc (Tamzit Rishum / Certificate / Divorce Decree / תעודת מצב אישי או גירושין)
-                   - Police_Clearance (Teudat Yosher / תעודת יושר)
-                   - Relationship_Letter (Letter of explanation / מכתב הסבר)
-                   - Chat_History (WhatsApp logs, calls / פירוט שיחות)
-                   - Joint_Photos (Photos of couple / תמונות משותפות)
-                   - Bank_Statement (3 months / תדפיס עובר ושב / בנק)
-                   - Salary_Slip (Tlush Maskoret / תלוש שכר)
-                   - Employment_Doc (Work confirmation / אישור מעסיק)
-                   - National_Insurance (Bituach Leumi docs / ביטוח לאומי)
-                   - Rental_Contract (חוזה שכירות)
-                   - Utility_Bill (Arnona, Water, Electricity / חשבונות חשמל/מים/ארנונה)
-                   - Recommendation_Letter (Letters from friends/family / מכתבי ממליצים)
-                   - Power_of_Attorney (Yipuy Koach / ייפוי כוח)
-                   - Lawyer_License (רישיון עו״ד)
-                   - Minor_Document (Birth cert or custody of children / מסמכי קטינים)
-                   - Other (Any other document)
+                You are a strict document analysis system for the Israeli Ministry of Interior.
+                Analyze the image carefully.
 
-                2. Extract First and Last Name (Latin/English transliteration).
-                3. Rotation: needed angle (0, 90, 180, 270) CLOCKWISE to make text horizontal.
+                TASK 1: ORIENTATION CHECK (CRITICAL)
+                Look at the text direction (Hebrew or English). 
+                - If the text is upside down, you MUST return 180.
+                - If the text is vertical (pointing left), return 90.
+                - If the text is vertical (pointing right), return 270.
+                - Only return 0 if the text is perfectly horizontal and readable.
                 
-                Return JSON: {"doc_type": "...", "person_name": "...", "rotation": 0}
+                TASK 2: CLASSIFICATION
+                Classify into ONE category:
+                   - ID_Document (Teudat Zehut)
+                   - Passport (Foreign Passport)
+                   - Photo_ID (Passport photo)
+                   - Marriage_Certificate
+                   - Birth_Certificate
+                   - Police_Clearance (Teudat Yosher)
+                   - Marital_Status_Doc
+                   - Bank_Statement
+                   - Salary_Slip (Tlush Maskoret)
+                   - Rental_Contract
+                   - Utility_Bill
+                   - Relationship_Letter
+                   - Other
+
+                TASK 3: EXTRACTION
+                Extract the First and Last Name (Latin characters). If the document is upside down, rotate it mentally first!
+
+                OUTPUT JSON ONLY:
+                {"doc_type": "...", "person_name": "...", "rotation": 0}
                 """
                 
                 ai_result = analyze_document(base64_img, prompt)
@@ -125,38 +113,29 @@ class DocumentProcessor:
             except Exception as e:
                 logger.error(f"AI Analysis failed: {e}")
 
-            # 3. ПОВОРОТ (Если нужно)
+            # --- ПОВОРОТ ---
             rotation_needed = doc_data.get("rotation", 0)
-            
-            # Если это картинка и ИИ попросил поворот (90, 180, 270)
             if not is_pdf_input and rotation_needed in [90, 180, 270]:
                 self._rotate_image_by_angle(local_path, rotation_needed)
             
-            # Конвертируем в PDF для финального хранения (если была картинка)
             if not is_pdf_input:
                 final_upload_path = self._convert_jpg_to_pdf(local_path)
                 if not final_upload_path: final_upload_path = local_path
 
-            # 4. ФОРМИРОВАНИЕ ПУТЕЙ И ИМЕН
+            # --- ПУТИ И ЗАГРУЗКА ---
             person_name = doc_data.get('person_name', 'Client').strip()
-            # Убираем опасные символы из имени
             safe_person_name = "".join(c for c in person_name if c.isalnum() or c in (' ', '_', '-')).strip()
             if not safe_person_name: safe_person_name = "Client"
             
             doc_type = doc_data.get('doc_type', 'Doc').replace(" ", "_")
             date_str = datetime.now().strftime("%Y-%m-%d")
             
-            # Папка клиента на Диске
             remote_folder = f"/Clients/{user_phone}/{safe_person_name}"
-            # Итоговое имя файла
             final_filename = f"{date_str}_{doc_type}.pdf"
             remote_path = f"{remote_folder}/{final_filename}"
             
-            # 5. ЗАГРУЗКА
-            # Сначала пробуем загрузить, получаем результат
             success = upload_file_to_disk(final_upload_path, remote_path)
 
-            # Чистим мусор (локальные файлы)
             to_remove = [local_path, ai_input_path, final_upload_path]
             for path in set(to_remove):
                 if path and os.path.exists(path) and "temp_files" in path: 
@@ -164,14 +143,12 @@ class DocumentProcessor:
 
             if success:
                 return {
-                    "status": "success", 
-                    "doc_type": doc_type, 
-                    "person": person_name, 
-                    "filename": final_filename,
+                    "status": "success", "doc_type": doc_type, 
+                    "person": person_name, "filename": final_filename,
                     "remote_path": remote_path
                 }
             else:
-                return {"status": "error", "message": "Ошибка загрузки на Диск"}
+                return {"status": "error", "message": "Ошибка загрузки"}
 
         except Exception as e:
             logger.error(f"Critical error: {e}")
