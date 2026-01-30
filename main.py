@@ -23,8 +23,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- 1. СПИСОК ОБЯЗАТЕЛЬНЫХ ДОКУМЕНТОВ (СТУПРО) ---
-# Эти документы бот будет требовать при команде "Статус".
-# Остальные (фото, чаты) принимаются, но не являются блокирующими.
+# Эти документы бот будет требовать.
 REQUIRED_DOCS = {
     "ID_Document",          # ТЗ / ID
     "Passport",             # Загранпаспорт
@@ -54,10 +53,8 @@ class AdminAuth(AuthenticationBackend):
             logger.error("CRITICAL: ADMIN_PASSWORD_HASH is empty in .env!")
             return False
 
-        # Хешируем введенный пароль
         input_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
         
-        # Сравниваем безопасно
         user_match = (username == stored_user)
         pass_match = hmac.compare_digest(input_hash, stored_hash)
 
@@ -73,7 +70,6 @@ class AdminAuth(AuthenticationBackend):
     async def authenticate(self, request: StarletteRequest) -> bool:
         return bool(request.session.get("token"))
 
-# Инициализация админки
 authentication_backend = AdminAuth(secret_key=os.getenv("SECRET_KEY", "change_me_please"))
 admin = Admin(app, engine, authentication_backend=authentication_backend)
 
@@ -104,7 +100,6 @@ def send_whatsapp_message(to_number, body_text):
     """Отправка сообщения через Twilio"""
     try:
         from_number = 'whatsapp:+14155238886' 
-        # Если номер не начинается с whatsapp:, добавляем
         to = f"whatsapp:{to_number}" if not to_number.startswith("whatsapp:") else to_number
         
         twilio_client.messages.create(
@@ -116,26 +111,24 @@ def send_whatsapp_message(to_number, body_text):
         logger.error(f"Failed to send message to {to_number}: {e}")
 
 def process_file_task(user_phone, media_url, media_type):
-    """Фоновая задача: Скачать -> Распознать -> Загрузить -> Ответить"""
+    """Фоновая задача: Скачать -> Распознать -> Загрузить (Ориг+PDF) -> Ответить"""
     with Session(engine) as session:
-        # Определяем расширение для временного файла
         ext = ".jpg"
         if media_type == "application/pdf":
             ext = ".pdf"
         elif "image" in media_type:
             ext = ".jpg"
         
-        # Уникальное имя временного файла
         filename = f"temp_{user_phone}_{os.urandom(4).hex()}{ext}"
         local_path = os.path.join("temp_files", filename)
         
         try:
-            # 1. Скачиваем файл от Twilio
+            # 1. Скачиваем
             response = requests.get(media_url)
             with open(local_path, 'wb') as f:
                 f.write(response.content)
             
-            # 2. Обрабатываем (ИИ + Конвертация + Загрузка на Диск)
+            # 2. Обрабатываем
             result = processor.process_and_upload(user_phone, local_path, filename)
             
             if result["status"] == "success":
@@ -153,7 +146,6 @@ def process_file_task(user_phone, media_url, media_type):
                     session.commit()
                     session.refresh(client)
                 elif client.full_name == "Unknown" and person_name != "Unknown":
-                    # Если ИИ узнал имя, а у нас было Unknown - обновляем
                     client.full_name = person_name
                     session.add(client)
                     session.commit()
@@ -163,29 +155,26 @@ def process_file_task(user_phone, media_url, media_type):
                 session.add(new_doc)
                 session.commit()
                 
-                # 5. Генерируем ссылку (если провайдер поддерживает)
-                public_link = publish_file(remote_path)
-                
-                # 6. Проверяем, чего не хватает
+                # 5. Проверяем, чего не хватает (Полный список)
                 docs_stmt = select(Document).where(Document.client_id == client.id)
                 existing_docs = session.exec(docs_stmt).all()
                 uploaded_types = {d.doc_type for d in existing_docs}
                 
                 missing = REQUIRED_DOCS - uploaded_types
                 
-                # 7. Формируем ответ
+                # 6. Формируем ответ
                 msg = f"✅ Принято: {doc_type}\n"
                 msg += f"👤 Досье: {client.full_name}\n"
                 
                 if missing:
-                    msg += f"\n⏳ Осталось собрать: {len(missing)} шт."
+                    msg += f"\n⏳ Осталось собрать ({len(missing)} шт):\n- "
+                    msg += "\n- ".join(missing)
                 else:
-                    msg += "\n🎉 Полный комплект собран!"
+                    msg += "\n🎉 Полный комплект собран! Ожидайте проверки."
                 
                 send_whatsapp_message(user_phone, msg)
                 
             else:
-                # Ошибка обработки (например, сбой загрузки)
                 send_whatsapp_message(user_phone, f"⚠️ Ошибка: {result.get('message')}")
                 
         except Exception as e:
@@ -193,30 +182,26 @@ def process_file_task(user_phone, media_url, media_type):
             send_whatsapp_message(user_phone, "❌ Произошла внутренняя ошибка сервера.")
             
         finally:
-            # Всегда удаляем локальный файл
             if os.path.exists(local_path):
-                try:
-                    os.remove(local_path)
-                except:
-                    pass
+                try: os.remove(local_path)
+                except: pass
 
 # --- 5. WEBHOOK ДЛЯ WHATSAPP ---
 @app.post("/whatsapp")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     form_data = await request.form()
     
-    # Twilio присылает номер в формате "whatsapp:+12345..."
     user_phone = form_data.get("From", "").replace("whatsapp:", "")
     media_url = form_data.get("MediaUrl0")
     media_type = form_data.get("MediaContentType0")
     body_text = form_data.get("Body", "").strip().lower()
     
-    # Сценарий 1: Пришел файл
+    # 1. Пришел файл
     if media_url:
         background_tasks.add_task(process_file_task, user_phone, media_url, media_type)
         return "OK"
     
-    # Сценарий 2: Команда "Статус"
+    # 2. Команда "Статус"
     elif body_text in ["статус", "status", "отчет", "1", "check"]:
         with Session(engine) as session:
             statement = select(Client).where(Client.phone_number == user_phone)
@@ -235,11 +220,8 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
                 report += f"📥 Всего файлов: {len(existing_docs)}\n"
                 
                 if uploaded_types:
-                    # Показываем последние 3 загруженных типа для краткости
-                    shown_docs = list(uploaded_types)[:3]
-                    report += f"✅ Есть: {', '.join(shown_docs)}"
-                    if len(uploaded_types) > 3:
-                        report += " и др."
+                    # ВЫВОДИМ ПОЛНЫЙ СПИСОК (убрали [:3])
+                    report += f"✅ Есть:\n- " + "\n- ".join(uploaded_types)
                     report += "\n"
                 
                 if missing:
@@ -250,7 +232,7 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
                 send_whatsapp_message(user_phone, report)
         return "OK"
     
-    # Сценарий 3: Просто текст
+    # 3. Просто текст
     else:
-        send_whatsapp_message(user_phone, "🤖 Привет! Я LawBot.\n📸 Пришли мне фото или PDF документа, и я сохраню его в твоё досье.")
+        send_whatsapp_message(user_phone, "🤖 Привет! Я LawBot.\n📸 Пришли мне фото или PDF, и я сохраню их.")
         return "OK"

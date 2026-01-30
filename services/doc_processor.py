@@ -18,8 +18,8 @@ class DocumentProcessor:
 
     def _fix_exif_orientation(self, image_path):
         """
-        Убирает скрытые теги поворота (EXIF), которые ставят телефоны.
-        Делаем это ДО того, как отдавать ИИ, чтобы мы и ИИ видели одно и то же.
+        Убирает скрытые теги поворота (EXIF), которые ставят телефоны (Samsung/iPhone).
+        Делаем это ДО того, как отдавать ИИ, чтобы мы и ИИ видели картинку одинаково.
         """
         try:
             img = Image.open(image_path)
@@ -33,6 +33,7 @@ class DocumentProcessor:
         try:
             images = convert_from_path(pdf_path)
             if not images: return None
+            # Берем первую страницу для анализа
             jpg_path = pdf_path.replace(".pdf", "_temp_analysis.jpg")
             images[0].save(jpg_path, "JPEG")
             return jpg_path
@@ -42,7 +43,7 @@ class DocumentProcessor:
 
     def _apply_clock_rotation(self, image_path, clock_position):
         """
-        Поворот на основе циферблата.
+        Поворот на основе циферблата (Clock Face Method).
         clock_position: где сейчас находится ВЕРХ страницы (12, 3, 6, 9).
         PIL rotate(90) крутит ПРОТИВ часовой стрелки (влево).
         """
@@ -121,7 +122,7 @@ class DocumentProcessor:
                 base64_img = self._encode_image(ai_input_path)
                 
                 prompt = """
-                Analyze this document for Israeli Ministry of Interior.
+                Analyze this document for Israeli Ministry of Interior (Misrad Hapnim).
                 
                 TASK 1: ORIENTATION (CLOCK FACE METHOD)
                 Imagine the image is a clock face. Where is the TOP HEADER of the text pointing?
@@ -131,7 +132,24 @@ class DocumentProcessor:
                 - If top of text points Left, return "9_oclock".
                 
                 TASK 2: CLASSIFICATION
-                Classify document type (e.g. ID_Document, Passport, Birth_Certificate, Marriage_Certificate, Bank_Statement, Salary_Slip, etc).
+                Classify document type into ONE category:
+                   - ID_Document (Teudat Zehut)
+                   - Passport (Foreign Passport)
+                   - Photo_ID (Passport photo)
+                   - Marriage_Certificate
+                   - Birth_Certificate
+                   - Police_Clearance (Teudat Yosher)
+                   - Marital_Status_Doc (Tamzit Rishum / Divorce)
+                   - Bank_Statement
+                   - Salary_Slip (Tlush Maskoret)
+                   - Rental_Contract
+                   - Utility_Bill (Arnona / Water / Electricity)
+                   - Relationship_Letter
+                   - Recommendation_Letter
+                   - Chat_History
+                   - Joint_Photos
+                   - Employment_Doc
+                   - Other
                 
                 TASK 3: EXTRACTION
                 Extract First and Last Name (Latin). Read mentally even if rotated.
@@ -150,13 +168,14 @@ class DocumentProcessor:
             if not is_pdf_input and top_pos != "12_oclock":
                 self._apply_clock_rotation(local_path, top_pos)
             
-            # Конвертация в PDF
+            # Конвертация в PDF (финальный "чистый" файл)
             if not is_pdf_input:
                 final_upload_path = self._convert_jpg_to_pdf(local_path)
                 if not final_upload_path: final_upload_path = local_path
 
-            # --- ЗАГРУЗКА ---
+            # --- ФОРМИРОВАНИЕ ПУТЕЙ ---
             person_name = doc_data.get('person_name', 'Client').strip()
+            # Убираем опасные символы
             safe_person_name = "".join(c for c in person_name if c.isalnum() or c in (' ', '_', '-')).strip()
             if not safe_person_name: safe_person_name = "Client"
             
@@ -164,11 +183,29 @@ class DocumentProcessor:
             date_str = datetime.now().strftime("%Y-%m-%d")
             
             remote_folder = f"/Clients/{user_phone}/{safe_person_name}"
-            final_filename = f"{date_str}_{doc_type}.pdf"
-            remote_path = f"{remote_folder}/{final_filename}"
             
-            success = upload_file_to_disk(final_upload_path, remote_path)
+            # 1. Имя для обработанного PDF
+            final_filename = f"{date_str}_{doc_type}.pdf"
+            remote_path_pdf = f"{remote_folder}/{final_filename}"
+            
+            # 2. Имя для ОРИГИНАЛА (добавляем _orig)
+            # Берем расширение из исходного файла (обычно .jpg или .pdf)
+            orig_ext = os.path.splitext(local_path)[1]
+            if not orig_ext: orig_ext = ".jpg" 
+            remote_path_orig = f"{remote_folder}/{date_str}_{doc_type}_orig{orig_ext}"
 
+            # --- ЗАГРУЗКА ---
+            # 1. Загружаем PDF (основной)
+            success = upload_file_to_disk(final_upload_path, remote_path_pdf)
+            
+            # 2. Загружаем ОРИГИНАЛ (резервная копия)
+            try:
+                # local_path здесь — это исходный файл (возможно, с исправленным EXIF, но без обрезки)
+                upload_file_to_disk(local_path, remote_path_orig)
+            except Exception as e:
+                logger.error(f"Failed to upload original file: {e}")
+
+            # Чистим мусор
             to_remove = [local_path, ai_input_path, final_upload_path]
             for path in set(to_remove):
                 if path and os.path.exists(path) and "temp_files" in path: 
@@ -180,7 +217,7 @@ class DocumentProcessor:
                     "doc_type": doc_type, 
                     "person": person_name, 
                     "filename": final_filename,
-                    "remote_path": remote_path
+                    "remote_path": remote_path_pdf
                 }
             else:
                 return {"status": "error", "message": "Ошибка загрузки"}
