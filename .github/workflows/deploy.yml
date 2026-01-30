@@ -18,20 +18,16 @@ jobs:
           script: |
             cd /opt/lawbot
             
-            # Получаем имя текущей ветки
-            # GitHub Actions checkout работает в detached HEAD, поэтому берем из ref
             REF_NAME="${{ github.ref_name }}"
             echo "🔥 DETECTED BRANCH: $REF_NAME"
             
             if [[ "$REF_NAME" == "main" ]]; then
                 echo "🚀 DEPLOYING TO PRODUCTION (YANDEX)..."
                 
-                # 1. Обновляем код
                 git fetch origin main
                 git reset --hard origin/main
                 
-                # 2. Пишем .env для ПРОДА
-                echo "Creating Production .env..."
+                # .env для Прода
                 echo "STORAGE_PROVIDER=yandex" > .env
                 echo "YANDEX_DISK_TOKEN=${{ secrets.YANDEX_DISK_TOKEN }}" >> .env
                 echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
@@ -41,30 +37,27 @@ jobs:
                 echo "ADMIN_PASSWORD_HASH=${{ secrets.ADMIN_PASSWORD_HASH }}" >> .env
                 echo "SECRET_KEY=${{ secrets.SECRET_KEY }}" >> .env
                 
-                # 3. Перезапуск ПРОДА
-                docker-compose up -d --build --remove-orphans
+                # --- ВАЖНО: Добавили -p lawbot_prod ---
+                docker-compose -p lawbot_prod up -d --build --remove-orphans
                 
             elif [[ "$REF_NAME" == "develop" ]]; then
                 echo "🧪 DEPLOYING TO TEST (DROPBOX)..."
                 
-                # 1. Обновляем код
                 git fetch origin develop
                 git reset --hard origin/develop
                 
-                # 2. Пишем .env.test для ТЕСТА
-                echo "Creating Test .env.test..."
+                # .env.test для Теста
                 echo "STORAGE_PROVIDER=dropbox" > .env.test
                 echo "DROPBOX_TOKEN=${{ secrets.DROPBOX_TOKEN }}" >> .env.test
                 echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env.test
-                # Используем те же ключи Twilio (или другие, если есть)
                 echo "TWILIO_ACCOUNT_SID=${{ secrets.TWILIO_ACCOUNT_SID }}" >> .env.test
                 echo "TWILIO_AUTH_TOKEN=${{ secrets.TWILIO_AUTH_TOKEN }}" >> .env.test
                 echo "ADMIN_USERNAME=${{ secrets.ADMIN_USERNAME }}" >> .env.test
                 echo "ADMIN_PASSWORD_HASH=${{ secrets.ADMIN_PASSWORD_HASH }}" >> .env.test
                 echo "SECRET_KEY=${{ secrets.SECRET_KEY }}_test" >> .env.test
                 
-                # 3. Перезапуск ТЕСТА
-                docker-compose -f docker-compose.test.yml up -d --build --remove-orphans
+                # --- ВАЖНО: Добавили -p lawbot_test ---
+                docker-compose -p lawbot_test -f docker-compose.test.yml up -d --build --remove-orphans
             fi
             
             docker system prune -f
