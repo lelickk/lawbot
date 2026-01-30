@@ -29,14 +29,21 @@ class DocumentProcessor:
             return None
 
     def _rotate_image_by_angle(self, image_path, angle):
-        """Поворот изображения. Отрицательный угол = по часовой стрелке."""
+        """
+        Физически поворачивает картинку.
+        Убрали минус, чтобы изменить направление поворота.
+        """
         if angle == 0: return
         try:
             img = Image.open(image_path)
-            # Минус angle, чтобы крутить по часовой (как привычно людям)
-            img = img.rotate(-angle, expand=True) 
+            
+            # ИСПРАВЛЕНИЕ: Убрали минус. 
+            # Теперь направление поворота соответствует стандартному поведению PIL (против часовой).
+            # Если ИИ скажет "90", повернем на 90.
+            img = img.rotate(angle, expand=True) 
+            
             img.save(image_path)
-            logger.info(f"Image rotated by {angle} degrees (Clockwise)")
+            logger.info(f"Image rotated by {angle} degrees")
         except Exception as e:
             logger.error(f"Rotation failed: {e}")
 
@@ -78,7 +85,7 @@ class DocumentProcessor:
             try:
                 base64_img = self._encode_image(ai_input_path)
                 
-                # Промпт: содержит все ключевые документы из твоего списка
+                # Полный список документов для СТуПРО
                 prompt = """
                 Analyze this document for an Israeli Ministry of Interior (Misrad Hapnim) StuPro application.
                 
@@ -120,7 +127,8 @@ class DocumentProcessor:
 
             # 3. ПОВОРОТ (Если нужно)
             rotation_needed = doc_data.get("rotation", 0)
-            # Если это картинка и нужен поворот
+            
+            # Если это картинка и ИИ попросил поворот (90, 180, 270)
             if not is_pdf_input and rotation_needed in [90, 180, 270]:
                 self._rotate_image_by_angle(local_path, rotation_needed)
             
@@ -138,7 +146,7 @@ class DocumentProcessor:
             doc_type = doc_data.get('doc_type', 'Doc').replace(" ", "_")
             date_str = datetime.now().strftime("%Y-%m-%d")
             
-            # Папка клиента
+            # Папка клиента на Диске
             remote_folder = f"/Clients/{user_phone}/{safe_person_name}"
             # Итоговое имя файла
             final_filename = f"{date_str}_{doc_type}.pdf"
@@ -148,7 +156,7 @@ class DocumentProcessor:
             # Сначала пробуем загрузить, получаем результат
             success = upload_file_to_disk(final_upload_path, remote_path)
 
-            # Чистим мусор
+            # Чистим мусор (локальные файлы)
             to_remove = [local_path, ai_input_path, final_upload_path]
             for path in set(to_remove):
                 if path and os.path.exists(path) and "temp_files" in path: 
