@@ -3,10 +3,10 @@ version: '3.8'
 services:
   app:
     build: .
-    container_name: lawbot_app
+    container_name: lawbot_app      # <--- Имя для Прода
     restart: always
     ports:
-      - "8001:8000"  # <--- ВНЕШНИЙ 8001, ВНУТРЕННИЙ 8000
+      - "8001:8000"                 # <--- Внешний порт 8001
     env_file:
       - .env
     environment:
