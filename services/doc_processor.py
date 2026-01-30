@@ -16,6 +16,19 @@ class DocumentProcessor:
         self.temp_dir = "temp_files"
         os.makedirs(self.temp_dir, exist_ok=True)
 
+    def _fix_exif_orientation(self, image_path):
+        """
+        Убирает скрытые теги поворота (EXIF), которые ставят телефоны.
+        Делаем это ДО того, как отдавать ИИ, чтобы мы и ИИ видели одно и то же.
+        """
+        try:
+            img = Image.open(image_path)
+            # Если есть EXIF ориентация, применяем её физически к пикселям
+            img = ImageOps.exif_transpose(img)
+            img.save(image_path)
+        except Exception as e:
+            logger.warning(f"EXIF fix failed (maybe no exif data): {e}")
+
     def _convert_pdf_to_jpg(self, pdf_path):
         try:
             images = convert_from_path(pdf_path)
@@ -27,53 +40,51 @@ class DocumentProcessor:
             logger.error(f"Error converting PDF to JPG: {e}")
             return None
 
-    def _apply_orientation_fix(self, image_path, orientation):
+    def _apply_clock_rotation(self, image_path, clock_position):
         """
-        Поворачивает изображение на основе текстового описания ориентации.
-        PIL rotate(90) = Против часовой стрелки.
+        Поворот на основе циферблата.
+        clock_position: где сейчас находится ВЕРХ страницы (12, 3, 6, 9).
+        PIL rotate(90) крутит ПРОТИВ часовой стрелки (влево).
         """
-        if orientation == "normal": return
-        
+        if clock_position == "12_oclock": return
+
         try:
             img = Image.open(image_path)
             angle = 0
             
-            # Логика поворота (Железобетонная)
-            if orientation == "rotated_left":
-                # Верхушка букв смотрит ВЛЕВО. 
-                # Чтобы поставить ровно, нужно повернуть ПО ЧАСОВОЙ (CW).
-                angle = -90 
-            
-            elif orientation == "rotated_right":
-                # Верхушка букв смотрит ВПРАВО.
-                # Чтобы поставить ровно, нужно повернуть ПРОТИВ ЧАСОВОЙ (CCW).
+            if clock_position == "3_oclock":
+                # Верх смотрит направо (3 часа).
+                # Чтобы стало ровно (12), нужно крутить ВЛЕВО (против часовой) на 90.
                 angle = 90
             
-            elif orientation == "upside_down":
-                # Вверх ногами
+            elif clock_position == "6_oclock":
+                # Верх смотрит вниз (6 часов).
+                # Крутим на 180.
                 angle = 180
-                
+            
+            elif clock_position == "9_oclock":
+                # Верх смотрит налево (9 часов).
+                # Чтобы стало ровно (12), нужно крутить ВПРАВО (по часовой).
+                # rotate(-90) или rotate(270)
+                angle = -90
+            
             if angle != 0:
                 img = img.rotate(angle, expand=True)
                 img.save(image_path)
-                logger.info(f"Fixed orientation '{orientation}' by rotating {angle} degrees")
+                logger.info(f"Clock Rotation: Top was at {clock_position}, rotated by {angle} degrees")
                 
         except Exception as e:
             logger.error(f"Rotation failed: {e}")
 
     def _convert_jpg_to_pdf(self, jpg_path):
         try:
-            image = Image.open(jpg_path)
-            # Убираем exif_transpose, чтобы он не сбивал наш ручной поворот, 
-            # или используем его ДО анализа. Но лучше довериться ИИ.
-            # image = ImageOps.exif_transpose(image) 
-            
-            # Просто пересохраняем, чтобы сбросить EXIF ориентацию, если она была
-            image.save(jpg_path)
+            # Просто конвертируем, так как EXIF и поворот уже решены
+            with open(jpg_path, "rb") as f:
+                pdf_bytes = img2pdf.convert(f.read())
             
             pdf_path = os.path.splitext(jpg_path)[0] + ".pdf"
             with open(pdf_path, "wb") as f:
-                f.write(img2pdf.convert(jpg_path))
+                f.write(pdf_bytes)
             return pdf_path
         except Exception as e:
             logger.error(f"Error converting JPG to PDF: {e}")
@@ -93,39 +104,40 @@ class DocumentProcessor:
                 ai_input_path = self._convert_pdf_to_jpg(local_path)
                 final_upload_path = local_path 
             else:
+                # ВАЖНО: Сначала фиксим EXIF телефонов
+                self._fix_exif_orientation(local_path)
                 ai_input_path = local_path
 
             if not ai_input_path: raise Exception("Failed to prepare image for AI")
 
-            # --- АНАЛИЗ ИИ (Словесная ориентация) ---
+            # --- АНАЛИЗ ИИ (МЕТОД ЧАСОВ) ---
             doc_data = {
                 "doc_type": "Document", 
                 "person_name": "Unknown", 
-                "text_orientation": "normal"
+                "top_position": "12_oclock"
             }
             
             try:
                 base64_img = self._encode_image(ai_input_path)
                 
                 prompt = """
-                Analyze this document for Misrad Hapnim (Israeli Ministry of Interior).
+                Analyze this document for Israeli Ministry of Interior.
                 
-                TASK 1: ORIENTATION (CRITICAL)
-                Look at the text direction. Where is the TOP of the letters pointing?
-                Return "text_orientation" as one of:
-                - "normal" (Text is horizontal and readable)
-                - "upside_down" (Text is upside down)
-                - "rotated_left" (Top of text points to the LEFT side of image)
-                - "rotated_right" (Top of text points to the RIGHT side of image)
+                TASK 1: ORIENTATION (CLOCK FACE METHOD)
+                Imagine the image is a clock face. Where is the TOP HEADER of the text pointing?
+                - If text is upright, return "12_oclock".
+                - If top of text points Right, return "3_oclock".
+                - If top of text points Down (upside down), return "6_oclock".
+                - If top of text points Left, return "9_oclock".
                 
                 TASK 2: CLASSIFICATION
                 Classify document type (e.g. ID_Document, Passport, Birth_Certificate, Marriage_Certificate, Bank_Statement, Salary_Slip, etc).
                 
                 TASK 3: EXTRACTION
-                Extract First and Last Name (Latin). If text is rotated, read it mentally.
+                Extract First and Last Name (Latin). Read mentally even if rotated.
                 
                 OUTPUT JSON:
-                {"doc_type": "...", "person_name": "...", "text_orientation": "..."}
+                {"doc_type": "...", "person_name": "...", "top_position": "..."}
                 """
                 
                 ai_result = analyze_document(base64_img, prompt)
@@ -134,10 +146,11 @@ class DocumentProcessor:
                 logger.error(f"AI Analysis failed: {e}")
 
             # --- ПОВОРОТ ---
-            orientation = doc_data.get("text_orientation", "normal")
-            if not is_pdf_input and orientation != "normal":
-                self._apply_orientation_fix(local_path, orientation)
+            top_pos = doc_data.get("top_position", "12_oclock")
+            if not is_pdf_input and top_pos != "12_oclock":
+                self._apply_clock_rotation(local_path, top_pos)
             
+            # Конвертация в PDF
             if not is_pdf_input:
                 final_upload_path = self._convert_jpg_to_pdf(local_path)
                 if not final_upload_path: final_upload_path = local_path
