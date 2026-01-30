@@ -14,33 +14,67 @@ from sqladmin import Admin, ModelView
 from sqladmin.authentication import AuthenticationBackend
 from starlette.requests import Request as StarletteRequest
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Загрузка переменных окружения
 load_dotenv()
 app = FastAPI()
 
-# --- AUTH ---
+# --- 1. СПИСОК ОБЯЗАТЕЛЬНЫХ ДОКУМЕНТОВ (СТУПРО) ---
+# Эти документы бот будет требовать при команде "Статус".
+# Остальные (фото, чаты) принимаются, но не являются блокирующими.
+REQUIRED_DOCS = {
+    "ID_Document",          # ТЗ / ID
+    "Passport",             # Загранпаспорт
+    "Marriage_Certificate", # Свидетельство о браке
+    "Birth_Certificate",    # Свидетельство о рождении
+    "Police_Clearance",     # Справка о несудимости (Теудат Йошер)
+    "Marital_Status_Doc",   # Справка о семейном положении / Развод
+    "Relationship_Letter",  # Письмо о знакомстве
+    "Bank_Statement",       # Распечатка из банка
+    "Salary_Slip",          # Тлуши (зарплата)
+    "Rental_Contract",      # Договор аренды
+    "Utility_Bill",         # Счета (вода/свет/арнона)
+    "Recommendation_Letter" # Письма от друзей/семьи
+}
+
+# --- 2. НАСТРОЙКА АДМИНКИ (SQLAdmin) ---
 class AdminAuth(AuthenticationBackend):
     async def login(self, request: StarletteRequest) -> bool:
         form = await request.form()
         username = form.get("username")
         password = form.get("password")
+
         stored_user = os.getenv("ADMIN_USERNAME", "admin")
         stored_hash = os.getenv("ADMIN_PASSWORD_HASH")
-        if not stored_hash: return False
+
+        if not stored_hash:
+            logger.error("CRITICAL: ADMIN_PASSWORD_HASH is empty in .env!")
+            return False
+
+        # Хешируем введенный пароль
         input_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
-        if username == stored_user and hmac.compare_digest(input_hash, stored_hash):
+        
+        # Сравниваем безопасно
+        user_match = (username == stored_user)
+        pass_match = hmac.compare_digest(input_hash, stored_hash)
+
+        if user_match and pass_match:
             request.session.update({"token": "valid_token"})
             return True
         return False
+
     async def logout(self, request: StarletteRequest) -> bool:
         request.session.clear()
         return True
+
     async def authenticate(self, request: StarletteRequest) -> bool:
         return bool(request.session.get("token"))
 
-authentication_backend = AdminAuth(secret_key=os.getenv("SECRET_KEY", "change_me"))
+# Инициализация админки
+authentication_backend = AdminAuth(secret_key=os.getenv("SECRET_KEY", "change_me_please"))
 admin = Admin(app, engine, authentication_backend=authentication_backend)
 
 class ClientAdmin(ModelView, model=Client):
@@ -54,6 +88,7 @@ class DocumentAdmin(ModelView, model=Document):
 admin.add_view(ClientAdmin)
 admin.add_view(DocumentAdmin)
 
+# --- 3. ИНИЦИАЛИЗАЦИЯ СЕРВИСОВ ---
 twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
 twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
 twilio_client = TwilioClient(twilio_sid, twilio_token)
@@ -64,46 +99,43 @@ processor = DocumentProcessor()
 def on_startup():
     init_db()
 
-# --- НОВЫЙ СПИСОК СТУПРО ---
-# Сюда внесены основные категории. Если человек загрузит "Рисунки детей", 
-# они попадут в Other или Minor_Document, но не будут требоваться строго.
-REQUIRED_DOCS = {
-    "ID_Document",          # ТЗ
-    "Passport",             # Паспорт
-    "Photo_ID",             # Фото на паспорт
-    "Marriage_Certificate", # Свидетельство о браке
-    "Birth_Certificate",    # Свидетельство о рождении
-    "Police_Clearance",     # Справка о несудимости
-    "Marital_Status_Doc",   # Справка о семейном положении / Развод
-    "Relationship_Letter",  # Письмо о знакомстве
-    "Bank_Statement",       # Банк
-    "Salary_Slip",          # Тлуши
-    "Rental_Contract",      # Аренда
-    "Utility_Bill",         # Счета
-    "Recommendation_Letter" # Письма друзей
-}
-
+# --- 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def send_whatsapp_message(to_number, body_text):
+    """Отправка сообщения через Twilio"""
     try:
         from_number = 'whatsapp:+14155238886' 
+        # Если номер не начинается с whatsapp:, добавляем
         to = f"whatsapp:{to_number}" if not to_number.startswith("whatsapp:") else to_number
-        twilio_client.messages.create(from_=from_number, body=body_text, to=to)
+        
+        twilio_client.messages.create(
+            from_=from_number,
+            body=body_text,
+            to=to
+        )
     except Exception as e:
-        logger.error(f"Failed to send message: {e}")
+        logger.error(f"Failed to send message to {to_number}: {e}")
 
 def process_file_task(user_phone, media_url, media_type):
+    """Фоновая задача: Скачать -> Распознать -> Загрузить -> Ответить"""
     with Session(engine) as session:
+        # Определяем расширение для временного файла
         ext = ".jpg"
-        if media_type == "application/pdf": ext = ".pdf"
-        elif "image" in media_type: ext = ".jpg"
+        if media_type == "application/pdf":
+            ext = ".pdf"
+        elif "image" in media_type:
+            ext = ".jpg"
         
+        # Уникальное имя временного файла
         filename = f"temp_{user_phone}_{os.urandom(4).hex()}{ext}"
         local_path = os.path.join("temp_files", filename)
         
         try:
+            # 1. Скачиваем файл от Twilio
+            response = requests.get(media_url)
             with open(local_path, 'wb') as f:
-                f.write(requests.get(media_url).content)
+                f.write(response.content)
             
+            # 2. Обрабатываем (ИИ + Конвертация + Загрузка на Диск)
             result = processor.process_and_upload(user_phone, local_path, filename)
             
             if result["status"] == "success":
@@ -111,79 +143,114 @@ def process_file_task(user_phone, media_url, media_type):
                 person_name = result["person"]
                 remote_path = result.get("remote_path")
                 
+                # 3. Обновляем БД (Клиент)
                 statement = select(Client).where(Client.phone_number == user_phone)
                 client = session.exec(statement).first()
+                
                 if not client:
                     client = Client(phone_number=user_phone, full_name=person_name)
                     session.add(client)
                     session.commit()
                     session.refresh(client)
                 elif client.full_name == "Unknown" and person_name != "Unknown":
+                    # Если ИИ узнал имя, а у нас было Unknown - обновляем
                     client.full_name = person_name
                     session.add(client)
                     session.commit()
 
+                # 4. Обновляем БД (Документ)
                 new_doc = Document(client_id=client.id, doc_type=doc_type, file_path=result["filename"])
                 session.add(new_doc)
                 session.commit()
                 
+                # 5. Генерируем ссылку (если провайдер поддерживает)
                 public_link = publish_file(remote_path)
                 
+                # 6. Проверяем, чего не хватает
                 docs_stmt = select(Document).where(Document.client_id == client.id)
                 existing_docs = session.exec(docs_stmt).all()
                 uploaded_types = {d.doc_type for d in existing_docs}
                 
-                # Проверка: если загрузили что-то из списка "Другое" или "Minor", оно тоже считается
-                # Но мы проверяем только наличие ОСНОВНЫХ документов из REQUIRED_DOCS
                 missing = REQUIRED_DOCS - uploaded_types
                 
-                msg = f"✅ Сохранено: {doc_type}\n"
+                # 7. Формируем ответ
+                msg = f"✅ Принято: {doc_type}\n"
                 msg += f"👤 Досье: {client.full_name}\n"
-                if public_link: msg += f"🔗 Ссылка: {public_link}\n"
                 
                 if missing:
-                    msg += f"\n❌ Надо дослать ({len(missing)} шт):\n- " + "\n- ".join(missing)
+                    msg += f"\n⏳ Осталось собрать: {len(missing)} шт."
                 else:
-                    msg += "\n🎉 Базовый комплект собран!"
+                    msg += "\n🎉 Полный комплект собран!"
                 
                 send_whatsapp_message(user_phone, msg)
+                
             else:
+                # Ошибка обработки (например, сбой загрузки)
                 send_whatsapp_message(user_phone, f"⚠️ Ошибка: {result.get('message')}")
+                
         except Exception as e:
             logger.error(f"Task failed: {e}")
-            send_whatsapp_message(user_phone, "❌ Ошибка сервера.")
+            send_whatsapp_message(user_phone, "❌ Произошла внутренняя ошибка сервера.")
+            
         finally:
-            if os.path.exists(local_path): os.remove(local_path)
+            # Всегда удаляем локальный файл
+            if os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except:
+                    pass
 
+# --- 5. WEBHOOK ДЛЯ WHATSAPP ---
 @app.post("/whatsapp")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     form_data = await request.form()
+    
+    # Twilio присылает номер в формате "whatsapp:+12345..."
     user_phone = form_data.get("From", "").replace("whatsapp:", "")
     media_url = form_data.get("MediaUrl0")
     media_type = form_data.get("MediaContentType0")
     body_text = form_data.get("Body", "").strip().lower()
     
+    # Сценарий 1: Пришел файл
     if media_url:
         background_tasks.add_task(process_file_task, user_phone, media_url, media_type)
         return "OK"
-    elif body_text in ["статус", "status", "отчет", "1"]:
+    
+    # Сценарий 2: Команда "Статус"
+    elif body_text in ["статус", "status", "отчет", "1", "check"]:
         with Session(engine) as session:
             statement = select(Client).where(Client.phone_number == user_phone)
             client = session.exec(statement).first()
+            
             if not client:
-                send_whatsapp_message(user_phone, "📂 Пусто. Пришлите документы.")
+                send_whatsapp_message(user_phone, "📂 Ваше досье пусто. Пришлите документы.")
             else:
                 docs_stmt = select(Document).where(Document.client_id == client.id)
                 existing_docs = session.exec(docs_stmt).all()
                 uploaded_types = {d.doc_type for d in existing_docs}
+                
                 missing = REQUIRED_DOCS - uploaded_types
+                
                 report = f"📂 Досье: {client.full_name}\n"
-                report += f"📥 Файлов: {len(existing_docs)}\n"
-                if uploaded_types: report += "✅ Есть: " + ", ".join(uploaded_types) + "\n"
-                if missing: report += "\n❌ Нет:\n- " + "\n- ".join(missing)
-                else: report += "\n🎉 Всё собрано!"
+                report += f"📥 Всего файлов: {len(existing_docs)}\n"
+                
+                if uploaded_types:
+                    # Показываем последние 3 загруженных типа для краткости
+                    shown_docs = list(uploaded_types)[:3]
+                    report += f"✅ Есть: {', '.join(shown_docs)}"
+                    if len(uploaded_types) > 3:
+                        report += " и др."
+                    report += "\n"
+                
+                if missing:
+                    report += "\n❌ НУЖНО ДОСЛАТЬ:\n- " + "\n- ".join(missing)
+                else:
+                    report += "\n🎉 Всё отлично! Базовый комплект готов."
+                
                 send_whatsapp_message(user_phone, report)
         return "OK"
+    
+    # Сценарий 3: Просто текст
     else:
-        send_whatsapp_message(user_phone, "🤖 LawBot: Жду фото/PDF документов.")
+        send_whatsapp_message(user_phone, "🤖 Привет! Я LawBot.\n📸 Пришли мне фото или PDF документа, и я сохраню его в твоё досье.")
         return "OK"

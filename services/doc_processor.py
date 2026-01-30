@@ -1,13 +1,12 @@
 import os
+import cv2
 import logging
 import base64
 import img2pdf
-import numpy as np
-import cv2
 from datetime import datetime
-from PIL import Image, ImageOps, ImageEnhance # <--- Добавили ImageEnhance
+from PIL import Image, ImageOps
 from pdf2image import convert_from_path
-from services.storage_manager import upload_file # <--- Ссылка на новый менеджер хранилища
+from services.yandex_disk import upload_file_to_disk
 from services.openai_client import analyze_document
 
 logger = logging.getLogger(__name__)
@@ -17,11 +16,11 @@ class DocumentProcessor:
         self.temp_dir = "temp_files"
         os.makedirs(self.temp_dir, exist_ok=True)
 
-    # ... (методы _convert_pdf_to_jpg и _encode_image без изменений) ...
     def _convert_pdf_to_jpg(self, pdf_path):
         try:
             images = convert_from_path(pdf_path)
             if not images: return None
+            # Берем первую страницу для анализа
             jpg_path = pdf_path.replace(".pdf", "_temp_analysis.jpg")
             images[0].save(jpg_path, "JPEG")
             return jpg_path
@@ -29,56 +28,24 @@ class DocumentProcessor:
             logger.error(f"Error converting PDF to JPG: {e}")
             return None
 
-    def _encode_image(self, image_path):
-        with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
-
-    def _enhance_image(self, image_path):
-        """Улучшает качество: поворот, контраст, резкость"""
+    def _rotate_image_by_angle(self, image_path, angle):
+        """Поворот изображения. Отрицательный угол = по часовой стрелке."""
+        if angle == 0: return
         try:
             img = Image.open(image_path)
-            
-            # 1. Применяем EXIF (на всякий случай)
-            img = ImageOps.exif_transpose(img)
-
-            # 2. Увеличиваем контраст (делаем текст чернее, фон белее)
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(1.5) # +50% контраста
-
-            # 3. Увеличиваем резкость
-            enhancer = ImageEnhance.Sharpness(img)
-            img = enhancer.enhance(2.0) # +100% резкости
-
-            # Пересохраняем
-            img.save(image_path, quality=95)
-            logger.info("Image enhanced (Contrast+Sharpness)")
+            # Минус angle, чтобы крутить по часовой (как привычно людям)
+            img = img.rotate(-angle, expand=True) 
+            img.save(image_path)
+            logger.info(f"Image rotated by {angle} degrees (Clockwise)")
         except Exception as e:
-            logger.error(f"Enhancement failed: {e}")
-
-    def _rotate_image_smart(self, image_path, orientation):
-        """
-        Поворачивает на основе того, где находится ВЕРХ документа.
-        orientation: 'UP', 'RIGHT', 'DOWN', 'LEFT'
-        """
-        if orientation == 'UP': return
-        
-        angle = 0
-        if orientation == 'RIGHT': angle = 90    # Верх справа -> крутим на 90 влево (CCW)
-        elif orientation == 'DOWN': angle = 180  # Верх внизу -> крутим на 180
-        elif orientation == 'LEFT': angle = -90  # Верх слева -> крутим на 90 вправо (CW) или 270 CCW
-        
-        if angle != 0:
-            try:
-                img = Image.open(image_path)
-                img = img.rotate(angle, expand=True)
-                img.save(image_path)
-                logger.info(f"Image rotated by {angle} (Orientation was {orientation})")
-            except Exception as e:
-                logger.error(f"Rotation failed: {e}")
+            logger.error(f"Rotation failed: {e}")
 
     def _convert_jpg_to_pdf(self, jpg_path):
         try:
-            # Конвертация в PDF
+            image = Image.open(jpg_path)
+            image = ImageOps.exif_transpose(image) # Учитываем ориентацию EXIF
+            image.save(jpg_path)
+            
             pdf_path = os.path.splitext(jpg_path)[0] + ".pdf"
             with open(pdf_path, "wb") as f:
                 f.write(img2pdf.convert(jpg_path))
@@ -87,41 +54,63 @@ class DocumentProcessor:
             logger.error(f"Error converting JPG to PDF: {e}")
             return None
 
+    def _encode_image(self, image_path):
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+
     def process_and_upload(self, user_phone, local_path, original_filename):
         ai_input_path = None
         final_upload_path = None
         is_pdf_input = local_path.lower().endswith(".pdf")
 
         try:
+            # 1. Подготовка файла для ИИ (если PDF -> JPG)
             if is_pdf_input:
                 ai_input_path = self._convert_pdf_to_jpg(local_path)
                 final_upload_path = local_path 
             else:
                 ai_input_path = local_path
-            
-            if not ai_input_path: raise Exception("Failed to prepare image")
 
-            # 1. Сначала улучшаем качество (до отправки в ИИ, чтобы он лучше читал)
-            if not is_pdf_input:
-                self._enhance_image(ai_input_path)
+            if not ai_input_path: raise Exception("Failed to prepare image for AI")
 
-            # 2. АНАЛИЗ ИИ
-            doc_data = {"doc_type": "Document", "person_name": "Unknown", "orientation": "UP"}
+            # 2. АНАЛИЗ ИИ (СТУПРО / МВД)
+            doc_data = {"doc_type": "Document", "person_name": "Unknown", "rotation": 0}
             try:
                 base64_img = self._encode_image(ai_input_path)
                 
-                # НОВЫЙ ПРОМПТ
+                # Промпт: содержит все ключевые документы из твоего списка
                 prompt = """
-                Analyze this document for Israeli Ministry of Interior.
-                1. Classify document type (Passport, Teudat_Zehut, etc.).
-                2. Extract Person Name (Latin).
-                3. Determine ORIENTATION. Where is the TOP of the text currently facing?
-                   - UP (Text is upright, readable)
-                   - RIGHT (Text is rotated 90 deg clockwise, top is on the right)
-                   - DOWN (Text is upside down)
-                   - LEFT (Text is rotated 90 deg counter-clockwise, top is on the left)
+                Analyze this document for an Israeli Ministry of Interior (Misrad Hapnim) StuPro application.
                 
-                Return JSON: {"doc_type": "...", "person_name": "...", "orientation": "UP/RIGHT/DOWN/LEFT"}
+                1. Classify the document type into ONE of these categories:
+                   - ID_Document (Teudat Zehut / תעודת זהות)
+                   - Passport (Foreign Passport / דרכון)
+                   - Photo_ID (Passport photo / תמונה חזותית)
+                   - Application_Form (Ash/6, Mar/6, Ash/1, Ash/3 / טפסים ובקשות)
+                   - Marriage_Certificate (תעודת נישואין)
+                   - Birth_Certificate (תעודת לידה)
+                   - Name_Change_Cert (תעודת שינוי שם)
+                   - Marital_Status_Doc (Tamzit Rishum / Certificate / Divorce Decree / תעודת מצב אישי או גירושין)
+                   - Police_Clearance (Teudat Yosher / תעודת יושר)
+                   - Relationship_Letter (Letter of explanation / מכתב הסבר)
+                   - Chat_History (WhatsApp logs, calls / פירוט שיחות)
+                   - Joint_Photos (Photos of couple / תמונות משותפות)
+                   - Bank_Statement (3 months / תדפיס עובר ושב / בנק)
+                   - Salary_Slip (Tlush Maskoret / תלוש שכר)
+                   - Employment_Doc (Work confirmation / אישור מעסיק)
+                   - National_Insurance (Bituach Leumi docs / ביטוח לאומי)
+                   - Rental_Contract (חוזה שכירות)
+                   - Utility_Bill (Arnona, Water, Electricity / חשבונות חשמל/מים/ארנונה)
+                   - Recommendation_Letter (Letters from friends/family / מכתבי ממליצים)
+                   - Power_of_Attorney (Yipuy Koach / ייפוי כוח)
+                   - Lawyer_License (רישיון עו״ד)
+                   - Minor_Document (Birth cert or custody of children / מסמכי קטינים)
+                   - Other (Any other document)
+
+                2. Extract First and Last Name (Latin/English transliteration).
+                3. Rotation: needed angle (0, 90, 180, 270) CLOCKWISE to make text horizontal.
+                
+                Return JSON: {"doc_type": "...", "person_name": "...", "rotation": 0}
                 """
                 
                 ai_result = analyze_document(base64_img, prompt)
@@ -129,41 +118,52 @@ class DocumentProcessor:
             except Exception as e:
                 logger.error(f"AI Analysis failed: {e}")
 
-            # 3. ПОВОРОТ
-            orientation = doc_data.get("orientation", "UP")
+            # 3. ПОВОРОТ (Если нужно)
+            rotation_needed = doc_data.get("rotation", 0)
+            # Если это картинка и нужен поворот
+            if not is_pdf_input and rotation_needed in [90, 180, 270]:
+                self._rotate_image_by_angle(local_path, rotation_needed)
+            
+            # Конвертируем в PDF для финального хранения (если была картинка)
             if not is_pdf_input:
-                self._rotate_image_smart(local_path, orientation)
-                # После поворота и улучшений делаем финальный PDF
                 final_upload_path = self._convert_jpg_to_pdf(local_path)
                 if not final_upload_path: final_upload_path = local_path
 
-            # 4. ПУТИ И ЗАГРУЗКА
+            # 4. ФОРМИРОВАНИЕ ПУТЕЙ И ИМЕН
             person_name = doc_data.get('person_name', 'Client').strip()
-            safe_person_name = "".join(c for c in person_name if c.isalnum() or c in (' ', '_', '-')).strip() or "Client"
+            # Убираем опасные символы из имени
+            safe_person_name = "".join(c for c in person_name if c.isalnum() or c in (' ', '_', '-')).strip()
+            if not safe_person_name: safe_person_name = "Client"
+            
             doc_type = doc_data.get('doc_type', 'Doc').replace(" ", "_")
             date_str = datetime.now().strftime("%Y-%m-%d")
             
+            # Папка клиента
             remote_folder = f"/Clients/{user_phone}/{safe_person_name}"
+            # Итоговое имя файла
             final_filename = f"{date_str}_{doc_type}.pdf"
             remote_path = f"{remote_folder}/{final_filename}"
             
-            # --- ИСПОЛЬЗУЕМ УНИВЕРСАЛЬНЫЙ ЗАГРУЗЧИК ---
-            success, public_link = upload_file(final_upload_path, remote_path)
+            # 5. ЗАГРУЗКА
+            # Сначала пробуем загрузить, получаем результат
+            success = upload_file_to_disk(final_upload_path, remote_path)
 
-            # Чистка
+            # Чистим мусор
             to_remove = [local_path, ai_input_path, final_upload_path]
             for path in set(to_remove):
-                if path and os.path.exists(path) and "temp_files" in path: os.remove(path)
+                if path and os.path.exists(path) and "temp_files" in path: 
+                    os.remove(path)
 
             if success:
                 return {
-                    "status": "success", "doc_type": doc_type, 
-                    "person": person_name, "filename": final_filename,
-                    "remote_path": remote_path,
-                    "public_link": public_link
+                    "status": "success", 
+                    "doc_type": doc_type, 
+                    "person": person_name, 
+                    "filename": final_filename,
+                    "remote_path": remote_path
                 }
             else:
-                return {"status": "error", "message": "Ошибка загрузки"}
+                return {"status": "error", "message": "Ошибка загрузки на Диск"}
 
         except Exception as e:
             logger.error(f"Critical error: {e}")
