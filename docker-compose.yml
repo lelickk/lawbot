@@ -3,19 +3,18 @@ version: '3.8'
 services:
   app:
     build: .
-    container_name: lawbot_app      # <--- Имя для Прода
+    container_name: lawbot_app
     restart: always
     ports:
-      - "8001:8000"                 # <--- Внешний порт 8001
+      - "8001:8000"  # Внешний порт 8001 пробрасывается на внутренний 8000
     env_file:
       - .env
     environment:
       - TZ=Asia/Jerusalem
       - DATABASE_URL=sqlite:////data/lawbot.db
     volumes:
-     volumes:
-      - .:/app  # Пробрасываем код
+      - .:/app
       - ./google_credentials.json:/app/google_credentials.json
       - ./temp_files:/app/temp_files
-      - ./lawbot_data:/dat
+      - ./lawbot_data:/data  # <-- Исправил опечатку (/dat -> /data), чтобы база сохранялась
     command: gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --timeout 300 main:app
