@@ -5,61 +5,51 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-def analyze_document(base64_image, system_prompt):
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        logger.error("OPENAI_API_KEY is missing")
-        return None
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-    client = OpenAI(api_key=api_key)
-
+def analyze_document(image_base64, prompt_text):
+    """
+    Если image_base64 передан -> используем Vision (GPT-4o).
+    Если image_base64 is None -> используем Text (GPT-4o-mini), это дешевле и нет цензуры на картинки.
+    """
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
+        messages = []
+        
+        if image_base64:
+            # Режим Vision (Картинка + Текст)
+            messages = [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": system_prompt},
+                        {"type": "text", "text": prompt_text},
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            },
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
                         },
                     ],
                 }
-            ],
-            max_tokens=1000,
-            temperature=0.0, # Максимальная строгость
+            ]
+            model = "gpt-4o"
+        else:
+            # Режим Текст (Только промпт)
+            messages = [
+                {"role": "system", "content": "You are a helpful JSON parser."},
+                {"role": "user", "content": prompt_text}
+            ]
+            model = "gpt-4o-mini" # Дешево и быстро для текста
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=300,
+            response_format={"type": "json_object"} # Форсируем JSON
         )
 
         content = response.choices[0].message.content
-        
-        # --- ВАЖНО: Логируем сырой ответ, чтобы видеть ошибки ---
         logger.info(f"🤖 RAW AI RESPONSE: {content}")
 
-        if not content:
-            logger.error("OpenAI returned empty content")
-            return None
+        return json.loads(content)
 
-        # --- ЧИСТКА ОТВЕТА ---
-        # 1. Убираем Markdown обертки (```json ... ```)
-        cleaned_content = content.replace("```json", "").replace("```", "").strip()
-        
-        # 2. Если GPT написал вступление, ищем первую скобку {
-        start_index = cleaned_content.find("{")
-        end_index = cleaned_content.rfind("}")
-        
-        if start_index != -1 and end_index != -1:
-            cleaned_content = cleaned_content[start_index : end_index + 1]
-
-        # 3. Парсим
-        return json.loads(cleaned_content)
-
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON Parsing Error: {e}. Content was: {content}")
-        return None
     except Exception as e:
-        logger.error(f"OpenAI General Error: {e}")
+        logger.error(f"OpenAI Error: {e}")
         return None

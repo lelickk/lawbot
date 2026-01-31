@@ -14,8 +14,8 @@ from services.openai_client import analyze_document
 
 logger = logging.getLogger(__name__)
 
-# Путь к ключу, который ты скачал
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "google_credentials.json"
+if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "google_credentials.json"
 
 class DocumentProcessor:
     def __init__(self):
@@ -29,7 +29,6 @@ class DocumentProcessor:
 
     def _convert_pdf_to_jpg(self, pdf_path):
         try:
-            # DPI=200 достаточно
             return convert_from_path(pdf_path, dpi=200)
         except Exception as e:
             logger.error(f"PDF->JPG error: {e}")
@@ -37,135 +36,89 @@ class DocumentProcessor:
 
     def _google_vision_process(self, pil_image):
         """
-        Магия Google:
-        1. Определяет угол текста.
-        2. Определяет границы текста для обрезки.
+        Возвращает: (processed_image, extracted_text)
         """
+        extracted_text = ""
         try:
-            # Конвертируем в байты для отправки
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format='JPEG')
             content = img_byte_arr.getvalue()
 
             image = vision.Image(content=content)
             
-            # Запрашиваем детекцию текста (DOCUMENT_TEXT_DETECTION лучше для документов)
+            # ЗАПРОС К GOOGLE (Платный, но мы уже платим, так что берем всё)
             response = self.vision_client.document_text_detection(image=image)
             
             if response.error.message:
-                raise Exception(f'{response.error.message}')
+                logger.error(f"Google Error: {response.error.message}")
+                return pil_image, ""
 
-            # 1. ПОВОРОТ
-            # Google часто возвращает блоки с property 'detected_break' или ориентацией
-            # Но самый надежный способ - посмотреть на full_text_annotation.pages[0]
-            
+            # 1. Забираем полный текст (OCR)
+            if response.full_text_annotation:
+                extracted_text = response.full_text_annotation.text
+                # logger.info(f"📜 OCR Text (First 50 chars): {extracted_text[:50]}...")
+
+            # 2. Логика поворота
             angle = 0
             if response.full_text_annotation.pages:
-                # Берем первый блок текста и смотрим его уверенность и ориентацию
-                # Однако, проще положиться на анализ основных блоков
-                pass
+                page = response.full_text_annotation.pages[0]
+                if page.blocks:
+                    # Считаем угол по первому слову
+                    word = page.blocks[0].paragraphs[0].words[0]
+                    v = word.bounding_box.vertices
+                    dx = v[1].x - v[0].x
+                    dy = v[1].y - v[0].y
+                    import math
+                    rotation_angle = math.degrees(math.atan2(dy, dx))
+                    
+                    logger.info(f"Google Detected Text Angle: {rotation_angle:.2f}")
+
+                    final_rotation = 0
+                    if 45 <= rotation_angle < 135: final_rotation = 90
+                    elif -135 < rotation_angle <= -45: final_rotation = -90
+                    elif rotation_angle >= 135 or rotation_angle <= -135: final_rotation = 180
+                    
+                    if final_rotation != 0:
+                        logger.info(f"Applying rotation {final_rotation}")
+                        if final_rotation == 90: pil_image = pil_image.rotate(90, expand=True)
+                        elif final_rotation == -90: pil_image = pil_image.rotate(-90, expand=True)
+                        elif final_rotation == 180: pil_image = pil_image.rotate(180, expand=True)
+                        return pil_image, extracted_text
+
+            # 3. Логика обрезки (Crop)
+            # Если мы не вращали, попробуем обрезать
+            if response.full_text_annotation:
+                min_x, min_y = 10000, 10000
+                max_x, max_y = 0, 0
+                for page in response.full_text_annotation.pages:
+                    for block in page.blocks:
+                        v = block.bounding_box.vertices
+                        for point in v:
+                            min_x = min(min_x, point.x)
+                            min_y = min(min_y, point.y)
+                            max_x = max(max_x, point.x)
+                            max_y = max(max_y, point.y)
                 
-            # Простой метод ориентации:
-            # Анализируем bounding box всего текста. 
-            # Если ширина < высоты (а текст обычно горизонтальный), значит, возможно, надо повернуть.
-            # НО! Google возвращает текст уже "как есть". 
-            
-            # ДАВАЙ ИСПОЛЬЗОВАТЬ "TEXT_DETECTION" для определения ориентации самого большого блока
-            annotation = response.full_text_annotation
-            
-            if not annotation:
-                logger.warning("Google Vision: No text found")
-                return pil_image
+                pad = 30
+                w_orig, h_orig = pil_image.size
+                min_x = max(0, min_x - pad)
+                min_y = max(0, min_y - pad)
+                max_x = min(w_orig, max_x + pad)
+                max_y = min(h_orig, max_y + pad)
 
-            # Логика поворота: Ищем средний угол наклона слов
-            # Google возвращает vertices (вершины). Считаем угол по первой и второй вершине первого слова.
-            
-            first_page = annotation.pages[0]
-            if not first_page.blocks: return pil_image
-            
-            # Берем первый параграф
-            paragraph = first_page.blocks[0].paragraphs[0]
-            word = paragraph.words[0]
-            
-            # Координаты вершин слова
-            v = word.bounding_box.vertices
-            # v[0] = Top-Left, v[1] = Top-Right
-            
-            dx = v[1].x - v[0].x
-            dy = v[1].y - v[0].y
-            
-            # Вычисляем угол наклона текста
-            import math
-            rotation_angle = math.degrees(math.atan2(dy, dx))
-            
-            logger.info(f"Google Detected Text Angle: {rotation_angle:.2f}")
-
-            # Нормализуем угол (0, 90, -90, 180)
-            final_rotation = 0
-            if -45 < rotation_angle < 45: final_rotation = 0
-            elif 45 <= rotation_angle < 135: final_rotation = 90 # Текст идет вниз -> надо повернуть на -90 (или +270)
-            elif -135 < rotation_angle <= -45: final_rotation = -90 # Текст идет вверх -> надо повернуть на +90
-            else: final_rotation = 180
-
-            # --- ОБРЕЗКА (CROP) по границам текста ---
-            # Находим min_x, min_y, max_x, max_y по ВСЕМУ тексту
-            min_x, min_y = 10000, 10000
-            max_x, max_y = 0, 0
-            
-            for page in annotation.pages:
-                for block in page.blocks:
-                    v = block.bounding_box.vertices
-                    for point in v:
-                        min_x = min(min_x, point.x)
-                        min_y = min(min_y, point.y)
-                        max_x = max(max_x, point.x)
-                        max_y = max(max_y, point.y)
-            
-            # Добавляем отступы (Padding)
-            pad = 50
-            w_orig, h_orig = pil_image.size
-            
-            min_x = max(0, min_x - pad)
-            min_y = max(0, min_y - pad)
-            max_x = min(w_orig, max_x + pad)
-            max_y = min(h_orig, max_y + pad)
-            
-            logger.info(f"Google Crop: {min_x},{min_y} -> {max_x},{max_y}")
-            
-            # Сначала режем
-            pil_image = pil_image.crop((min_x, min_y, max_x, max_y))
-            
-            # Потом крутим (если нужно)
-            # Внимание: если мы режем по наклонному тексту, мы получим ромб.
-            # Правильнее сначала повернуть, потом резать. Но это сложная математика.
-            # Для начала просто повернем ВЕСЬ лист, если угол критический (90/180).
-            
-            # Переоценка стратегии:
-            # 1. Если угол близок к 90/180/-90 -> вращаем ВЕСЬ оригинал.
-            # 2. Потом запускаем Vision СНОВА (или режем по координатам, пересчитав их).
-            # Для экономии денег (1 запрос):
-            
-            if final_rotation != 0:
-                logger.info(f"Applying rotation {final_rotation}")
-                # PIL rotate крутит против часовой. 
-                # Если текст наклонен на 90 (вниз), нам надо повернуть на -90 (вернуть вверх).
-                # rotation_angle ~ 90 -> текст вертикально вниз. Чтобы стало ровно, крутим на -90.
-                if final_rotation == 90: pil_image = pil_image.rotate(90, expand=True) # Был тест, показал так
-                elif final_rotation == -90: pil_image = pil_image.rotate(-90, expand=True)
-                elif final_rotation == 180: pil_image = pil_image.rotate(180, expand=True)
+                area_crop = (max_x - min_x) * (max_y - min_y)
+                area_total = w_orig * h_orig
                 
-                # После поворота координаты кропа собьются. 
-                # Проще вернуть просто повернутый (но полный) документ, 
-                # либо (для идеала) можно обрезать "примерно" по центру, но это риск.
-                # Вернем повернутый оригинал.
-                return pil_image
+                # Защита: Если кроп адекватный (не весь лист и не точка)
+                if 0.2 < (area_crop / area_total) < 0.95:
+                    logger.info(f"Google Crop: {min_x},{min_y} -> {max_x},{max_y}")
+                    pil_image = pil_image.crop((min_x, min_y, max_x, max_y))
 
-            # Если угол 0 (текст ровный), то просто обрезаем лишние поля стола
-            return pil_image # Пока возвращаем кропнутый выше
+            return pil_image, extracted_text
 
         except Exception as e:
             logger.error(f"Google Vision Error: {e}")
-            return pil_image
+            return pil_image, extracted_text
 
     def _enhance_image(self, pil_image):
         enhancer = ImageEnhance.Contrast(pil_image)
@@ -193,26 +146,52 @@ class DocumentProcessor:
             temp_page_jpg = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}.jpg")
             
             try:
-                # --- GOOGLE VISION BLOCK ---
-                # 1. Вращаем и режем через Google
-                img = self._google_vision_process(img)
+                # 1. Google Vision (Rotate + Crop + EXTRACT TEXT)
+                img, ocr_text = self._google_vision_process(img)
 
-                # 2. Enhance
+                # 2. Enhance & Save
                 img = self._enhance_image(img)
                 img.save(temp_page_jpg, "JPEG", quality=90)
                 
-                # 3. Classify (OpenAI)
+                # 3. Classify & Extract Data (OpenAI)
                 doc_data = {"doc_type": "Document", "person_name": "Unknown"}
-                try:
-                    base64_img = self._encode_image(temp_page_jpg)
+                
+                # СТРАТЕГИЯ: Если есть текст от Гугла -> шлем текст (обходим цензуру).
+                # Если текста нет -> шлем картинку (надеемся на чудо).
+                
+                prompt = ""
+                image_arg = None
+                
+                if ocr_text and len(ocr_text) > 10:
+                    # ГИБРИДНЫЙ МЕТОД: Шлем текст
+                    logger.info("🚀 Sending OCR Text to OpenAI (Bypassing Image Filter)")
+                    prompt = f"""
+                    Analyze this extracted text from an ID document:
+                    '''
+                    {ocr_text}
+                    '''
+                    
+                    1. Classify Type: ID_Document, Passport, Birth_Certificate, Marriage_Certificate, etc.
+                    2. Extract Full Name (Latin characters prefered).
+                    
+                    Return JSON: {{"doc_type": "...", "person_name": "..."}}
+                    """
+                    image_arg = None # Не шлем картинку!
+                else:
+                    # FALLBACK: Шлем картинку (если OCR не сработал)
+                    logger.warning("⚠️ OCR empty, sending Image to OpenAI")
+                    image_arg = self._encode_image(temp_page_jpg)
                     prompt = """
-                    Classify document.
+                    Classify document and extract Name (Latin).
                     JSON: {"doc_type": "...", "person_name": "..."}
                     """
-                    res = analyze_document(base64_img, prompt)
+
+                try:
+                    res = analyze_document(image_arg, prompt)
                     if res: doc_data = res
                 except Exception as e: logger.error(f"AI Classify Error: {e}")
 
+                # 4. Save PDF
                 final_pdf_path = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}.pdf")
                 with open(temp_page_jpg, "rb") as f: pdf_bytes = img2pdf.convert(f.read())
                 with open(final_pdf_path, "wb") as f: f.write(pdf_bytes)
