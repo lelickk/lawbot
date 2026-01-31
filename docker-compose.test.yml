@@ -1,18 +1,20 @@
 version: '3.8'
 
 services:
-  app_test:
+  app:
     build: .
-    container_name: lawbot_app_test
+    container_name: lawbot_app_test    # <--- Имя с суффиксом _test
     restart: always
     ports:
-      - "8002:8000"  # Тест работает на порту 8002
+      - "8002:8000"                    # <--- Порт 8002 (чтобы не конфликтовать с Продом на 8001)
     env_file:
-      - .env.test    # Читает отдельный файл настроек
+      - .env.test                      # <--- Читает тестовый конфиг (создается в CI/CD)
     environment:
       - TZ=Asia/Jerusalem
-      - DATABASE_URL=sqlite:////data/lawbot_test.db # Отдельная база данных
+      - DATABASE_URL=sqlite:////data/lawbot_test.db  # <--- Отдельная база данных
     volumes:
+      - .:/app
+      - ./google_credentials.json:/app/google_credentials.json
       - ./temp_files:/app/temp_files
-      - ./lawbot_data_test:/data # Отдельная папка для базы
+      - ./lawbot_data_test:/data       # <--- Отдельная папка для данных
     command: gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --timeout 300 main:app
