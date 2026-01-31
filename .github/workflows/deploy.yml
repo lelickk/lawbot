@@ -21,6 +21,11 @@ jobs:
             REF_NAME="${{ github.ref_name }}"
             echo "🔥 DETECTED BRANCH: $REF_NAME"
             
+            # --- 1. ВОССТАНАВЛИВАЕМ КЛЮЧ GOOGLE (ОБЩИЙ ДЛЯ ВСЕХ ВЕТОК) ---
+            # Берем Base64 из секретов и декодируем обратно в JSON файл
+            echo "🔑 Restoring Google Credentials..."
+            echo "${{ secrets.GOOGLE_CREDENTIALS_BASE64 }}" | base64 -d > google_credentials.json
+            
             # --- ЛОГИКА ДЛЯ ПРОДАКШЕНА (MAIN) ---
             if [[ "$REF_NAME" == "main" ]]; then
                 echo "🚀 DEPLOYING TO PRODUCTION (YANDEX)..."
@@ -29,12 +34,10 @@ jobs:
                 git reset --hard origin/main
                 
                 # Создаем .env (Боевой)
-                # СЛЕВА: переменные для python-кода
-                # СПРАВА: имена секретов из твоего GitHub
                 echo "STORAGE_PROVIDER=yandex" > .env
                 echo "YANDEX_DISK_TOKEN=${{ secrets.YANDEX_DISK_TOKEN }}" >> .env
                 
-                # Исправленные имена секретов:
+                # Основные ключи
                 echo "OPENAI_API_KEY=${{ secrets.OPENAI_KEY }}" >> .env
                 echo "TWILIO_ACCOUNT_SID=${{ secrets.TWILIO_SID }}" >> .env
                 echo "TWILIO_AUTH_TOKEN=${{ secrets.TWILIO_TOKEN }}" >> .env
@@ -42,8 +45,11 @@ jobs:
                 echo "ADMIN_USERNAME=${{ secrets.ADMIN_USERNAME }}" >> .env
                 echo "ADMIN_PASSWORD_HASH=${{ secrets.ADMIN_PASSWORD_HASH }}" >> .env
                 echo "SECRET_KEY=${{ secrets.SECRET_KEY }}" >> .env
+
+                # ПОДКЛЮЧАЕМ GOOGLE VISION
+                echo "GOOGLE_APPLICATION_CREDENTIALS=/app/google_credentials.json" >> .env
                 
-                # Запуск Прода (использует .env по умолчанию)
+                # Запуск Прода
                 docker-compose -p lawbot_prod up -d --build --remove-orphans
                 
             # --- ЛОГИКА ДЛЯ ТЕСТА (DEVELOP) ---
@@ -57,7 +63,6 @@ jobs:
                 echo "STORAGE_PROVIDER=dropbox" > .env.test
                 echo "DROPBOX_TOKEN=${{ secrets.DROPBOX_TOKEN }}" >> .env.test
                 
-                # Исправленные имена секретов:
                 echo "OPENAI_API_KEY=${{ secrets.OPENAI_KEY }}" >> .env.test
                 echo "TWILIO_ACCOUNT_SID=${{ secrets.TWILIO_SID }}" >> .env.test
                 echo "TWILIO_AUTH_TOKEN=${{ secrets.TWILIO_TOKEN }}" >> .env.test
@@ -65,11 +70,14 @@ jobs:
                 echo "ADMIN_USERNAME=${{ secrets.ADMIN_USERNAME }}" >> .env.test
                 echo "ADMIN_PASSWORD_HASH=${{ secrets.ADMIN_PASSWORD_HASH }}" >> .env.test
                 echo "SECRET_KEY=${{ secrets.SECRET_KEY }}_test" >> .env.test
+
+                # ПОДКЛЮЧАЕМ GOOGLE VISION И ТУТ (на всякий случай)
+                echo "GOOGLE_APPLICATION_CREDENTIALS=/app/google_credentials.json" >> .env.test
                 
-                # Запуск Теста (ЯВНО указываем файл настроек --env-file)
+                # Запуск Теста
                 docker-compose -p lawbot_test -f docker-compose.test.yml --env-file .env.test up -d --build --remove-orphans
             fi
             
-            # Чистим старые образы, чтобы не забить диск
+            # Чистим старые образы
             docker system prune -f
             echo "✅ DEPLOY COMPLETE"

@@ -13,6 +13,7 @@ services:
       - TZ=Asia/Jerusalem
       - DATABASE_URL=sqlite:////data/lawbot.db
     volumes:
+     - ./google_credentials.json:/app/google_credentials.json
       - ./temp_files:/app/temp_files
       - ./lawbot_data:/data
     command: gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --timeout 300 main:app

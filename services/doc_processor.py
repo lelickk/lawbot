@@ -1,23 +1,27 @@
 import os
+import io
 import logging
 import base64
 import img2pdf
 import cv2
 import numpy as np
-import pytesseract
-import re
 from datetime import datetime
 from PIL import Image, ImageOps, ImageEnhance
+from google.cloud import vision
 from pdf2image import convert_from_path
 from services.yandex_disk import upload_file_to_disk
 from services.openai_client import analyze_document
 
 logger = logging.getLogger(__name__)
 
+# Путь к ключу, который ты скачал
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "google_credentials.json"
+
 class DocumentProcessor:
     def __init__(self):
         self.temp_dir = "temp_files"
         os.makedirs(self.temp_dir, exist_ok=True)
+        self.vision_client = vision.ImageAnnotatorClient()
 
     def _fix_exif_orientation_pil(self, img):
         try: return ImageOps.exif_transpose(img)
@@ -25,128 +29,148 @@ class DocumentProcessor:
 
     def _convert_pdf_to_jpg(self, pdf_path):
         try:
-            images = convert_from_path(pdf_path, dpi=200)
-            return images if images else None
+            # DPI=200 достаточно
+            return convert_from_path(pdf_path, dpi=200)
         except Exception as e:
             logger.error(f"PDF->JPG error: {e}")
             return None
 
-    def _determine_orientation_via_ocr(self, cv_image):
-        """Определяет угол поворота по количеству читаемых слов"""
-        import pytesseract
-        
-        h, w = cv_image.shape[:2]
-        scale = 1000 / max(h, w)
-        small = cv2.resize(cv_image, None, fx=scale, fy=scale)
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        
-        angles = [0, 90, 180, 270]
-        results = {}
+    def _google_vision_process(self, pil_image):
+        """
+        Магия Google:
+        1. Определяет угол текста.
+        2. Определяет границы текста для обрезки.
+        """
+        try:
+            # Конвертируем в байты для отправки
+            img_byte_arr = io.BytesIO()
+            pil_image.save(img_byte_arr, format='JPEG')
+            content = img_byte_arr.getvalue()
 
-        logger.info("🕵️ OCR Orientation check started...")
+            image = vision.Image(content=content)
+            
+            # Запрашиваем детекцию текста (DOCUMENT_TEXT_DETECTION лучше для документов)
+            response = self.vision_client.document_text_detection(image=image)
+            
+            if response.error.message:
+                raise Exception(f'{response.error.message}')
 
-        for angle in angles:
-            if angle == 0: rotated = gray
-            elif angle == 90: rotated = cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
-            elif angle == 180: rotated = cv2.rotate(gray, cv2.ROTATE_180)
-            elif angle == 270: rotated = cv2.rotate(gray, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            # 1. ПОВОРОТ
+            # Google часто возвращает блоки с property 'detected_break' или ориентацией
+            # Но самый надежный способ - посмотреть на full_text_annotation.pages[0]
+            
+            angle = 0
+            if response.full_text_annotation.pages:
+                # Берем первый блок текста и смотрим его уверенность и ориентацию
+                # Однако, проще положиться на анализ основных блоков
+                pass
+                
+            # Простой метод ориентации:
+            # Анализируем bounding box всего текста. 
+            # Если ширина < высоты (а текст обычно горизонтальный), значит, возможно, надо повернуть.
+            # НО! Google возвращает текст уже "как есть". 
+            
+            # ДАВАЙ ИСПОЛЬЗОВАТЬ "TEXT_DETECTION" для определения ориентации самого большого блока
+            annotation = response.full_text_annotation
+            
+            if not annotation:
+                logger.warning("Google Vision: No text found")
+                return pil_image
 
-            try:
-                # Читаем текст, ищем кириллицу и иврит
-                text = pytesseract.image_to_string(rotated, lang='heb+rus+eng')
-                clean_text = re.sub(r'[^а-яА-Яa-zA-Z\u0590-\u05FF]', '', text)
-                score = len(clean_text)
-                results[angle] = score
-            except Exception as e:
-                logger.error(f"OCR Error at {angle}: {e}")
-                results[angle] = 0
+            # Логика поворота: Ищем средний угол наклона слов
+            # Google возвращает vertices (вершины). Считаем угол по первой и второй вершине первого слова.
+            
+            first_page = annotation.pages[0]
+            if not first_page.blocks: return pil_image
+            
+            # Берем первый параграф
+            paragraph = first_page.blocks[0].paragraphs[0]
+            word = paragraph.words[0]
+            
+            # Координаты вершин слова
+            v = word.bounding_box.vertices
+            # v[0] = Top-Left, v[1] = Top-Right
+            
+            dx = v[1].x - v[0].x
+            dy = v[1].y - v[0].y
+            
+            # Вычисляем угол наклона текста
+            import math
+            rotation_angle = math.degrees(math.atan2(dy, dx))
+            
+            logger.info(f"Google Detected Text Angle: {rotation_angle:.2f}")
 
-        best_angle = max(results, key=results.get)
-        logger.info(f"✅ OCR Winner: {best_angle}° (Score: {results[best_angle]})")
-        return best_angle
+            # Нормализуем угол (0, 90, -90, 180)
+            final_rotation = 0
+            if -45 < rotation_angle < 45: final_rotation = 0
+            elif 45 <= rotation_angle < 135: final_rotation = 90 # Текст идет вниз -> надо повернуть на -90 (или +270)
+            elif -135 < rotation_angle <= -45: final_rotation = -90 # Текст идет вверх -> надо повернуть на +90
+            else: final_rotation = 180
+
+            # --- ОБРЕЗКА (CROP) по границам текста ---
+            # Находим min_x, min_y, max_x, max_y по ВСЕМУ тексту
+            min_x, min_y = 10000, 10000
+            max_x, max_y = 0, 0
+            
+            for page in annotation.pages:
+                for block in page.blocks:
+                    v = block.bounding_box.vertices
+                    for point in v:
+                        min_x = min(min_x, point.x)
+                        min_y = min(min_y, point.y)
+                        max_x = max(max_x, point.x)
+                        max_y = max(max_y, point.y)
+            
+            # Добавляем отступы (Padding)
+            pad = 50
+            w_orig, h_orig = pil_image.size
+            
+            min_x = max(0, min_x - pad)
+            min_y = max(0, min_y - pad)
+            max_x = min(w_orig, max_x + pad)
+            max_y = min(h_orig, max_y + pad)
+            
+            logger.info(f"Google Crop: {min_x},{min_y} -> {max_x},{max_y}")
+            
+            # Сначала режем
+            pil_image = pil_image.crop((min_x, min_y, max_x, max_y))
+            
+            # Потом крутим (если нужно)
+            # Внимание: если мы режем по наклонному тексту, мы получим ромб.
+            # Правильнее сначала повернуть, потом резать. Но это сложная математика.
+            # Для начала просто повернем ВЕСЬ лист, если угол критический (90/180).
+            
+            # Переоценка стратегии:
+            # 1. Если угол близок к 90/180/-90 -> вращаем ВЕСЬ оригинал.
+            # 2. Потом запускаем Vision СНОВА (или режем по координатам, пересчитав их).
+            # Для экономии денег (1 запрос):
+            
+            if final_rotation != 0:
+                logger.info(f"Applying rotation {final_rotation}")
+                # PIL rotate крутит против часовой. 
+                # Если текст наклонен на 90 (вниз), нам надо повернуть на -90 (вернуть вверх).
+                # rotation_angle ~ 90 -> текст вертикально вниз. Чтобы стало ровно, крутим на -90.
+                if final_rotation == 90: pil_image = pil_image.rotate(90, expand=True) # Был тест, показал так
+                elif final_rotation == -90: pil_image = pil_image.rotate(-90, expand=True)
+                elif final_rotation == 180: pil_image = pil_image.rotate(180, expand=True)
+                
+                # После поворота координаты кропа собьются. 
+                # Проще вернуть просто повернутый (но полный) документ, 
+                # либо (для идеала) можно обрезать "примерно" по центру, но это риск.
+                # Вернем повернутый оригинал.
+                return pil_image
+
+            # Если угол 0 (текст ровный), то просто обрезаем лишние поля стола
+            return pil_image # Пока возвращаем кропнутый выше
+
+        except Exception as e:
+            logger.error(f"Google Vision Error: {e}")
+            return pil_image
 
     def _enhance_image(self, pil_image):
         enhancer = ImageEnhance.Contrast(pil_image)
-        pil_image = enhancer.enhance(1.3)
-        enhancer = ImageEnhance.Sharpness(pil_image)
-        pil_image = enhancer.enhance(1.1)
+        pil_image = enhancer.enhance(1.2)
         return pil_image
-
-    def _smart_crop_v2(self, pil_image):
-        """
-        Умная обрезка с защитой от ошибок (слишком мелкий/крупный кроп).
-        """
-        logger.info("🛠️ DEBUG: SmartCrop v3 (Safety Net) is ACTIVE") # <--- МАРКЕР ВЕРСИИ
-        try:
-            full_img_cv = np.array(pil_image)
-            if len(full_img_cv.shape) == 3: full_img_cv = full_img_cv[:, :, ::-1].copy()
-            else: full_img_cv = cv2.cvtColor(full_img_cv, cv2.COLOR_GRAY2BGR)
-
-            h_orig, w_orig = full_img_cv.shape[:2]
-            
-            # Масштабируем для анализа
-            target_h = 800.0
-            scale = target_h / float(h_orig)
-            w_small = int(w_orig * scale)
-            h_small = int(target_h)
-            small_img = cv2.resize(full_img_cv, (w_small, h_small))
-
-            gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            
-            # Canny Edge Detection
-            edged = cv2.Canny(blurred, 30, 150) 
-            
-            # Жирная дилатация (сливаем текст в пятна)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
-            dilated = cv2.dilate(edged, kernel, iterations=2)
-
-            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            if not contours:
-                return pil_image
-
-            largest = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(largest)
-            
-            area_rect = w * h
-            area_total = w_small * h_small
-            ratio = area_rect / area_total
-
-            # --- ЗАЩИТА ОТ ДУРАКА ---
-            # Если бот нашел "мусор" (меньше 25% экрана) - НЕ РЕЖЕМ!
-            if ratio < 0.25:
-                logger.warning(f"⛔ SmartCrop: Contour too small ({ratio:.0%}). Returning ORIGINAL.")
-                return pil_image  # Возвращаем полный лист!
-
-            # Если документ > 75% экрана - это скан, НЕ РЕЖЕМ!
-            if ratio > 0.75:
-                logger.info(f"✅ SmartCrop: Document fills frame ({ratio:.0%}). Returning ORIGINAL.")
-                return pil_image
-
-            # Иначе режем
-            logger.info(f"✂️ SmartCrop: Valid document found ({ratio:.0%}). Cropping...")
-            
-            x = int(x / scale)
-            y = int(y / scale)
-            w = int(w / scale)
-            h = int(h / scale)
-
-            pad = 40
-            x = max(0, x - pad)
-            y = max(0, y - pad)
-            w = min(w_orig - x, w + 2*pad)
-            h = min(h_orig - y, h + 2*pad)
-
-            return pil_image.crop((x, y, x+w, y+h))
-
-        except Exception as e:
-            logger.error(f"Crop Error: {e}")
-            return pil_image
-
-        except Exception as e:
-            logger.error(f"Crop Error: {e}")
-            return pil_image
 
     def _encode_image(self, path):
         with open(path, "rb") as f: return base64.b64encode(f.read()).decode('utf-8')
@@ -162,7 +186,6 @@ class DocumentProcessor:
         except Exception as e: return [{"status": "error", "message": f"Read error: {e}"}]
 
         if not pil_images: return [{"status": "error", "message": "No images"}]
-
         source_file_uploaded = False
 
         for i, img in enumerate(pil_images, start=1):
@@ -170,33 +193,20 @@ class DocumentProcessor:
             temp_page_jpg = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}.jpg")
             
             try:
-                # 1. OCR Rotation
-                cv_img = np.array(img)
-                if len(cv_img.shape) == 3: cv_img = cv_img[:, :, ::-1].copy()
-                
-                best_angle = self._determine_orientation_via_ocr(cv_img)
-                
-                if best_angle == 90: img = img.rotate(-90, expand=True)
-                elif best_angle == 180: img = img.rotate(180, expand=True)
-                elif best_angle == 270: img = img.rotate(-270, expand=True)
+                # --- GOOGLE VISION BLOCK ---
+                # 1. Вращаем и режем через Google
+                img = self._google_vision_process(img)
 
-                # 2. Smart Crop (с защитой)
-                img = self._smart_crop_v2(img)
-
-                # 3. Enhance
+                # 2. Enhance
                 img = self._enhance_image(img)
-
                 img.save(temp_page_jpg, "JPEG", quality=90)
                 
-                # 4. Классификация
+                # 3. Classify (OpenAI)
                 doc_data = {"doc_type": "Document", "person_name": "Unknown"}
                 try:
                     base64_img = self._encode_image(temp_page_jpg)
                     prompt = """
-                    Classify document for Israeli Ministry of Interior.
-                    Types: ID_Document, Passport, Birth_Certificate, Marriage_Certificate, 
-                    Police_Clearance, Bank_Statement, Salary_Slip, Rental_Contract, Utility_Bill.
-                    Extract Name (Latin) if possible.
+                    Classify document.
                     JSON: {"doc_type": "...", "person_name": "..."}
                     """
                     res = analyze_document(base64_img, prompt)
