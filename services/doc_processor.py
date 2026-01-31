@@ -76,6 +76,7 @@ class DocumentProcessor:
         """
         Умная обрезка с защитой от ошибок (слишком мелкий/крупный кроп).
         """
+        logger.info("🛠️ DEBUG: SmartCrop v3 (Safety Net) is ACTIVE") # <--- МАРКЕР ВЕРСИИ
         try:
             full_img_cv = np.array(pil_image)
             if len(full_img_cv.shape) == 3: full_img_cv = full_img_cv[:, :, ::-1].copy()
@@ -94,9 +95,9 @@ class DocumentProcessor:
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
             
             # Canny Edge Detection
-            edged = cv2.Canny(blurred, 30, 150) # Понизил пороги, чтобы видеть слабые границы
+            edged = cv2.Canny(blurred, 30, 150) 
             
-            # ВАЖНО: Делаем "жирную" дилатацию, чтобы слить текст и границы в одно пятно
+            # Жирная дилатация (сливаем текст в пятна)
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
             dilated = cv2.dilate(edged, kernel, iterations=2)
 
@@ -112,35 +113,36 @@ class DocumentProcessor:
             area_total = w_small * h_small
             ratio = area_rect / area_total
 
-            # --- ЛОГИКА ЗАЩИТЫ ---
-            
-            # 1. Если нашли что-то слишком мелкое (меньше 25% кадра) - это ошибка (печать/подпись).
-            # Возвращаем оригинал!
+            # --- ЗАЩИТА ОТ ДУРАКА ---
+            # Если бот нашел "мусор" (меньше 25% экрана) - НЕ РЕЖЕМ!
             if ratio < 0.25:
-                logger.warning(f"SmartCrop: Contour too small ({ratio:.0%}). Returning ORIGINAL.")
-                return pil_image
+                logger.warning(f"⛔ SmartCrop: Contour too small ({ratio:.0%}). Returning ORIGINAL.")
+                return pil_image  # Возвращаем полный лист!
 
-            # 2. Если документ занимает почти весь кадр (> 75%) - это скан.
-            # Возвращаем оригинал!
+            # Если документ > 75% экрана - это скан, НЕ РЕЖЕМ!
             if ratio > 0.75:
-                logger.info(f"SmartCrop: Document fills frame ({ratio:.0%}). Returning ORIGINAL.")
+                logger.info(f"✅ SmartCrop: Document fills frame ({ratio:.0%}). Returning ORIGINAL.")
                 return pil_image
 
-            # Если всё ок (от 25% до 75%) - режем
-            logger.info(f"SmartCrop: Valid document found ({ratio:.0%}). Cropping...")
+            # Иначе режем
+            logger.info(f"✂️ SmartCrop: Valid document found ({ratio:.0%}). Cropping...")
             
             x = int(x / scale)
             y = int(y / scale)
             w = int(w / scale)
             h = int(h / scale)
 
-            pad = 40 # Чуть больше отступ
+            pad = 40
             x = max(0, x - pad)
             y = max(0, y - pad)
             w = min(w_orig - x, w + 2*pad)
             h = min(h_orig - y, h + 2*pad)
 
             return pil_image.crop((x, y, x+w, y+h))
+
+        except Exception as e:
+            logger.error(f"Crop Error: {e}")
+            return pil_image
 
         except Exception as e:
             logger.error(f"Crop Error: {e}")
