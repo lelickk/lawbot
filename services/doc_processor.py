@@ -9,7 +9,7 @@ from datetime import datetime
 from PIL import Image, ImageOps, ImageEnhance
 from google.cloud import vision
 from pdf2image import convert_from_path
-from services.yandex_disk import upload_file_to_disk
+from services.storage import upload_file_to_cloud
 from services.openai_client import analyze_document
 
 logger = logging.getLogger(__name__)
@@ -217,11 +217,11 @@ class DocumentProcessor:
                     orig_ext = os.path.splitext(local_path)[1] or ".jpg"
                     remote_orig = f"{base_folder}/Originals/{date_s}_{dtype}_Source_orig{orig_ext}"
                     try:
-                        upload_file_to_disk(local_path, remote_orig)
+                        upload_file_to_cloud(local_path, remote_orig)
                         source_file_uploaded = True
                     except: pass
 
-                if upload_file_to_disk(final_pdf_path, remote_path_pdf):
+                if upload_file_to_cloud(final_pdf_path, remote_path_pdf):
                     processed_results.append({
                         "status": "success", "doc_type": dtype, "person": person, 
                         "filename": remote_filename, "remote_path": remote_path_pdf

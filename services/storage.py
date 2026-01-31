@@ -1,45 +1,92 @@
 import os
-import shutil
-from pathlib import Path
+import logging
+import yadisk
+import dropbox
+from dropbox.files import WriteMode
+from dropbox.exceptions import ApiError
 
-# Папка, где будем хранить документы (локально)
-BASE_STORAGE_DIR = "filestorage"
+logger = logging.getLogger(__name__)
 
-def save_document_locally(file_bytes, filename, analysis_data):
+# Читаем конфиг
+PROVIDER = os.getenv("STORAGE_PROVIDER", "yandex").lower()
+YANDEX_TOKEN = os.getenv("YANDEX_DISK_TOKEN")
+DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN")
+
+def _get_yandex_client():
+    if not YANDEX_TOKEN:
+        logger.error("❌ Yandex Token is missing!")
+        return None
+    return yadisk.YaDisk(token=YANDEX_TOKEN)
+
+def _get_dropbox_client():
+    if not DROPBOX_TOKEN:
+        logger.error("❌ Dropbox Token is missing!")
+        return None
+    return dropbox.Dropbox(DROPBOX_TOKEN)
+
+def upload_file_to_cloud(local_path, remote_path):
     """
-    Принимает файл и данные от ИИ.
-    Создает папку клиента и сохраняет файл с красивым именем.
+    Универсальная функция загрузки.
+    remote_path должен быть полным: /Clients/+7999/Name/file.pdf
     """
-    
-    # 1. Вытаскиваем данные из анализа
-    # Если ИИ не нашел имя, назовем "Неизвестный Клиент"
-    full_name = analysis_data.get("full_name", "Unknown_Client")
-    doc_type = analysis_data.get("doc_type", "Document")
-    doc_date = analysis_data.get("doc_date", "NoDate")
-    
-    # Очищаем имя от плохих символов (чтобы Windows не ругалась)
-    safe_name = "".join([c for c in full_name if c.isalpha() or c.isspace()]).strip()
-    
-    # 2. Формируем путь к папке клиента
-    # Пример: filestorage/Костюковский Леонид Михайлович
-    client_folder = os.path.join(BASE_STORAGE_DIR, safe_name)
-    
-    # Создаем папку, если её нет
-    os.makedirs(client_folder, exist_ok=True)
-    
-    # 3. Формируем новое имя файла
-    # Определяем расширение (сохраним как PDF, если исходник был PDF)
-    ext = ".pdf" if filename.lower().endswith(".pdf") else ".jpg"
-    
-    # Заменяем точки в дате на тире (17.07.2003 -> 17-07-2003)
-    safe_date = doc_date.replace(".", "-").replace("/", "-")
-    
-    # Имя: Паспорт_17-07-2003.pdf
-    new_filename = f"{doc_type}_{safe_date}{ext}"
-    final_path = os.path.join(client_folder, new_filename)
-    
-    # 4. Сохраняем файл
-    with open(final_path, "wb") as f:
-        f.write(file_bytes)
+    if PROVIDER == "dropbox":
+        return _upload_to_dropbox(local_path, remote_path)
+    else:
+        return _upload_to_yandex(local_path, remote_path)
+
+# --- YANDEX LOGIC ---
+def _upload_to_yandex(local_path, remote_path):
+    y = _get_yandex_client()
+    if not y: return False
+
+    try:
+        # Создаем папки рекурсивно (если их нет)
+        folder_path = os.path.dirname(remote_path)
+        # Яндекс требует создавать каждую папку по очереди, но yadisk умеет это делать? 
+        # Проще пройтись циклом, но yadisk.mkdir не рекурсивен.
+        # Упрощенная логика создания папок:
+        parts = folder_path.strip("/").split("/")
+        current_path = ""
+        for part in parts:
+            current_path += f"/{part}"
+            if not y.exists(current_path):
+                try: y.mkdir(current_path)
+                except: pass
+
+        if y.exists(remote_path):
+            logger.info(f"File {remote_path} exists, overwriting...")
+            y.remove(remote_path)
+
+        y.upload(local_path, remote_path)
+        logger.info(f"✅ Uploaded to Yandex: {remote_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Yandex Upload Error: {e}")
+        return False
+
+# --- DROPBOX LOGIC ---
+def _upload_to_dropbox(local_path, remote_path):
+    dbx = _get_dropbox_client()
+    if not dbx: return False
+
+    try:
+        # Dropbox требует слэш в начале
+        if not remote_path.startswith('/'):
+            remote_path = '/' + remote_path
+
+        with open(local_path, 'rb') as f:
+            # WriteMode.overwrite перезапишет файл, если он есть
+            dbx.files_upload(
+                f.read(), 
+                remote_path, 
+                mode=WriteMode('overwrite')
+            )
         
-    return final_path
+        logger.info(f"✅ Uploaded to Dropbox: {remote_path}")
+        return True
+    except ApiError as e:
+        logger.error(f"Dropbox API Error: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Dropbox Generic Error: {e}")
+        return False
