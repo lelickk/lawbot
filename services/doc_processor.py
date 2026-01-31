@@ -46,20 +46,18 @@ class DocumentProcessor:
 
             image = vision.Image(content=content)
             
-            # ЗАПРОС К GOOGLE (Платный, но мы уже платим, так что берем всё)
+            # ЗАПРОС К GOOGLE
             response = self.vision_client.document_text_detection(image=image)
             
             if response.error.message:
                 logger.error(f"Google Error: {response.error.message}")
                 return pil_image, ""
 
-            # 1. Забираем полный текст (OCR)
+            # 1. Забираем полный текст
             if response.full_text_annotation:
                 extracted_text = response.full_text_annotation.text
-                # logger.info(f"📜 OCR Text (First 50 chars): {extracted_text[:50]}...")
 
-            # 2. Логика поворота
-            angle = 0
+            # 2. Логика поворота (Text Orientation)
             if response.full_text_annotation.pages:
                 page = response.full_text_annotation.pages[0]
                 if page.blocks:
@@ -71,25 +69,27 @@ class DocumentProcessor:
                     import math
                     rotation_angle = math.degrees(math.atan2(dy, dx))
                     
-                    logger.info(f"Google Detected Text Angle: {rotation_angle:.2f}")
-
+                    # Нормализуем угол
                     final_rotation = 0
                     if 45 <= rotation_angle < 135: final_rotation = 90
                     elif -135 < rotation_angle <= -45: final_rotation = -90
                     elif rotation_angle >= 135 or rotation_angle <= -135: final_rotation = 180
                     
                     if final_rotation != 0:
-                        logger.info(f"Applying rotation {final_rotation}")
+                        logger.info(f"🔄 Applying rotation {final_rotation} (Detected: {rotation_angle:.2f})")
                         if final_rotation == 90: pil_image = pil_image.rotate(90, expand=True)
                         elif final_rotation == -90: pil_image = pil_image.rotate(-90, expand=True)
                         elif final_rotation == 180: pil_image = pil_image.rotate(180, expand=True)
+                        # Если повернули, координаты старого ответа Google уже не валидны для кропа.
+                        # Возвращаем повернутый оригинал.
                         return pil_image, extracted_text
 
             # 3. Логика обрезки (Crop)
-            # Если мы не вращали, попробуем обрезать
             if response.full_text_annotation:
                 min_x, min_y = 10000, 10000
                 max_x, max_y = 0, 0
+                
+                # Находим границы всего текста
                 for page in response.full_text_annotation.pages:
                     for block in page.blocks:
                         v = block.bounding_box.vertices
@@ -99,6 +99,7 @@ class DocumentProcessor:
                             max_x = max(max_x, point.x)
                             max_y = max(max_y, point.y)
                 
+                # Добавляем отступы
                 pad = 30
                 w_orig, h_orig = pil_image.size
                 min_x = max(0, min_x - pad)
@@ -106,13 +107,26 @@ class DocumentProcessor:
                 max_x = min(w_orig, max_x + pad)
                 max_y = min(h_orig, max_y + pad)
 
+                # --- ВАЖНАЯ ПРОВЕРКА РАЗМЕРА ---
                 area_crop = (max_x - min_x) * (max_y - min_y)
                 area_total = w_orig * h_orig
-                
-                # Защита: Если кроп адекватный (не весь лист и не точка)
-                if 0.2 < (area_crop / area_total) < 0.95:
-                    logger.info(f"Google Crop: {min_x},{min_y} -> {max_x},{max_y}")
-                    pil_image = pil_image.crop((min_x, min_y, max_x, max_y))
+                ratio = area_crop / area_total
+
+                logger.info(f"📐 Text Coverage: {ratio:.1%}")
+
+                # Если текст занимает меньше 20% страницы (это штамп на пустом листе)
+                if ratio < 0.20:
+                    logger.warning(f"⚠️ Text area too small ({ratio:.1%}). Skipping crop to keep context.")
+                    return pil_image, extracted_text # Возвращаем ПОЛНЫЙ лист
+
+                # Если текст занимает почти весь лист (это скан)
+                if ratio > 0.90:
+                     logger.info(f"✅ Document fills page ({ratio:.1%}). Skipping crop.")
+                     return pil_image, extracted_text
+
+                # Иначе - режем (это паспорт на столе)
+                logger.info(f"✂️ Google Crop: {min_x},{min_y} -> {max_x},{max_y}")
+                pil_image = pil_image.crop((min_x, min_y, max_x, max_y))
 
             return pil_image, extracted_text
 
@@ -146,44 +160,40 @@ class DocumentProcessor:
             temp_page_jpg = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}.jpg")
             
             try:
-                # 1. Google Vision (Rotate + Crop + EXTRACT TEXT)
+                # 1. Google Vision
                 img, ocr_text = self._google_vision_process(img)
 
                 # 2. Enhance & Save
                 img = self._enhance_image(img)
                 img.save(temp_page_jpg, "JPEG", quality=90)
                 
-                # 3. Classify & Extract Data (OpenAI)
+                # 3. Classify (OpenAI) - ГИБРИДНЫЙ МЕТОД
                 doc_data = {"doc_type": "Document", "person_name": "Unknown"}
                 
-                # СТРАТЕГИЯ: Если есть текст от Гугла -> шлем текст (обходим цензуру).
-                # Если текста нет -> шлем картинку (надеемся на чудо).
+                # Если OCR текста много (>50 символов) -> шлем текст (быстро, без цензуры)
+                # Если мало (штампы) -> шлем КАРТИНКУ (надежнее для штампов)
                 
                 prompt = ""
                 image_arg = None
                 
-                if ocr_text and len(ocr_text) > 10:
-                    # ГИБРИДНЫЙ МЕТОД: Шлем текст
-                    logger.info("🚀 Sending OCR Text to OpenAI (Bypassing Image Filter)")
+                if ocr_text and len(ocr_text) > 50:
+                    logger.info("🚀 Sending OCR Text to OpenAI")
                     prompt = f"""
-                    Analyze this extracted text from an ID document:
-                    '''
-                    {ocr_text}
-                    '''
+                    Analyze this extracted text from a document page:
+                    '''{ocr_text[:3000]}''' 
                     
-                    1. Classify Type: ID_Document, Passport, Birth_Certificate, Marriage_Certificate, etc.
-                    2. Extract Full Name (Latin characters prefered).
+                    1. Classify Type: ID_Document, Passport, Birth_Certificate, Marriage_Certificate, Divorce_Certificate, etc.
+                    2. Extract Full Name (Latin). Look for "Name", "Given Name", or transliterated names.
                     
                     Return JSON: {{"doc_type": "...", "person_name": "..."}}
                     """
-                    image_arg = None # Не шлем картинку!
+                    image_arg = None
                 else:
-                    # FALLBACK: Шлем картинку (если OCR не сработал)
-                    logger.warning("⚠️ OCR empty, sending Image to OpenAI")
+                    logger.warning("⚠️ Little text found, sending IMAGE to OpenAI")
                     image_arg = self._encode_image(temp_page_jpg)
                     prompt = """
                     Classify document and extract Name (Latin).
-                    JSON: {"doc_type": "...", "person_name": "..."}
+                    JSON: {{"doc_type": "...", "person_name": "..."}}
                     """
 
                 try:
@@ -191,7 +201,7 @@ class DocumentProcessor:
                     if res: doc_data = res
                 except Exception as e: logger.error(f"AI Classify Error: {e}")
 
-                # 4. Save PDF
+                # 4. Save PDF & Upload
                 final_pdf_path = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}.pdf")
                 with open(temp_page_jpg, "rb") as f: pdf_bytes = img2pdf.convert(f.read())
                 with open(final_pdf_path, "wb") as f: f.write(pdf_bytes)
