@@ -15,20 +15,23 @@ class YandexDiskClient:
         self.base_url = "https://cloud-api.yandex.net/v1/disk/resources"
 
     def create_folder(self, path):
-        """Создает папку (и все родительские, если нужно)"""
+        """Создает папку рекурсивно, корректно обрабатывая спецсимволы (+)"""
         if not path: return
         
-        # Разбиваем путь на части и создаем по очереди
         parts = path.strip("/").split("/")
         current_path = ""
         
         for part in parts:
             current_path += "/" + part
-            url = f"{self.base_url}?path={current_path}"
-            requests.put(url, headers=self.headers)
+            # ВАЖНО: Передаем path через params, чтобы requests закодировал '+' как '%2B'
+            params = {"path": current_path}
+            resp = requests.put(self.base_url, headers=self.headers, params=params)
+            
+            # 201 = Created, 409 = Already exists (это нормально)
+            if resp.status_code not in [201, 409]:
+                logger.error(f"Failed to create folder {current_path}: {resp.status_code} {resp.text}")
 
     def get_upload_link(self, remote_path):
-        """Получает URL для загрузки файла"""
         url = f"{self.base_url}/upload"
         params = {"path": remote_path, "overwrite": "true"}
         
@@ -36,44 +39,27 @@ class YandexDiskClient:
         if resp.status_code == 200:
             return resp.json().get("href")
         else:
-            logger.error(f"Get upload link failed: {resp.text}")
+            logger.error(f"Get upload link failed for {remote_path}: {resp.text}")
             return None
 
     def publish_resource(self, remote_path):
-        """
-        Публикует файл и возвращает публичную ссылку.
-        Делает это в два этапа:
-        1. PUT publish (открыть доступ)
-        2. GET meta (получить ссылку)
-        """
         publish_url = f"{self.base_url}/publish"
         params = {"path": remote_path}
         
-        # 1. Публикуем
-        resp = requests.put(publish_url, headers=self.headers, params=params)
-        if resp.status_code not in [200, 201]:
-            # Если уже опубликован (409) - это ок, идем дальше
-            if resp.status_code != 409:
-                logger.error(f"Publish failed: {resp.text}")
-                return None
+        requests.put(publish_url, headers=self.headers, params=params)
 
-        # 2. Запрашиваем метаданные, чтобы найти ссылку
         meta_url = self.base_url
         meta_params = {"path": remote_path, "fields": "public_url"}
         
-        # Иногда Яндекс не отдает ссылку мгновенно, делаем простую повторную попытку
-        for _ in range(3):
+        for _ in range(5): # Пробуем 5 раз с задержкой
             meta_resp = requests.get(meta_url, headers=self.headers, params=meta_params)
             if meta_resp.status_code == 200:
                 link = meta_resp.json().get("public_url")
-                if link:
-                    return link
-            time.sleep(0.5)
+                if link: return link
+            time.sleep(1.0) # Ждем секунду
             
-        logger.warning(f"File {remote_path} published, but public_url not returned.")
+        logger.warning(f"File {remote_path} published, but public_url missing.")
         return None
-
-# --- Глобальные функции для использования в других модулях ---
 
 _client = None
 
@@ -84,11 +70,9 @@ def _get_client():
     return _client
 
 def upload_file_to_disk(local_path, remote_path):
-    """Основная функция загрузки"""
     client = _get_client()
-    
     try:
-        # 1. Создаем папку (на всякий случай)
+        # 1. Создаем папку
         folder = os.path.dirname(remote_path)
         client.create_folder(folder)
         
@@ -96,7 +80,7 @@ def upload_file_to_disk(local_path, remote_path):
         upload_href = client.get_upload_link(remote_path)
         if not upload_href: return False
         
-        # 3. Загружаем
+        # 3. Грузим
         with open(local_path, "rb") as f:
             files = {"file": f}
             resp = requests.put(upload_href, files=files)
@@ -107,13 +91,11 @@ def upload_file_to_disk(local_path, remote_path):
         else:
             logger.error(f"Upload failed: {resp.text}")
             return False
-            
     except Exception as e:
         logger.error(f"Yandex Disk Error: {e}")
         return False
 
 def publish_file(remote_path):
-    """Публикация файла и возврат ссылки"""
     client = _get_client()
     try:
         return client.publish_resource(remote_path)
