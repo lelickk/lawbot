@@ -6,7 +6,7 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# 3. УСТАНОВКА СИСТЕМНЫХ БИБЛИОТЕК
+# Устанавливаем системные зависимости + TESSERACT и языки
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
@@ -19,6 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libx11-xcb1 \
     libxi6 \
     poppler-utils \
+    ffmpeg \
+    tesseract-ocr \
+    tesseract-ocr-rus \
+    tesseract-ocr-heb \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # 4. Python зависимости
