@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 app = FastAPI()
 
-# --- 1. СПИСОК ДОКУМЕНТОВ ---
 REQUIRED_DOCS = {
     "ID_Document", "Passport", "Marriage_Certificate", "Birth_Certificate",
     "Police_Clearance", "Marital_Status_Doc", "Relationship_Letter",
@@ -28,7 +27,7 @@ REQUIRED_DOCS = {
     "Recommendation_Letter"
 }
 
-# --- 2. АДМИНКА (ИСПРАВЛЕНО: Вернули классы) ---
+# --- ADMIN SETUP ---
 class AdminAuth(AuthenticationBackend):
     async def login(self, request: StarletteRequest) -> bool:
         form = await request.form()
@@ -36,7 +35,6 @@ class AdminAuth(AuthenticationBackend):
         password = form.get("password")
         stored_user = os.getenv("ADMIN_USERNAME", "admin")
         stored_hash = os.getenv("ADMIN_PASSWORD_HASH")
-        
         if not stored_hash: return False
         input_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
         if username == stored_user and hmac.compare_digest(input_hash, stored_hash):
@@ -54,7 +52,6 @@ class AdminAuth(AuthenticationBackend):
 authentication_backend = AdminAuth(secret_key=os.getenv("SECRET_KEY", "change_me_please"))
 admin = Admin(app, engine, authentication_backend=authentication_backend)
 
-# ВАЖНО: Определяем настройки через классы, иначе ошибка TypeError
 class ClientAdmin(ModelView, model=Client):
     column_list = [Client.id, Client.phone_number, Client.full_name, Client.created_at]
     icon = "fa-solid fa-user"
@@ -66,7 +63,7 @@ class DocumentAdmin(ModelView, model=Document):
 admin.add_view(ClientAdmin)
 admin.add_view(DocumentAdmin)
 
-# --- 3. СЕРВИСЫ ---
+# --- SERVICES ---
 twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
 processor = DocumentProcessor()
 
@@ -74,7 +71,6 @@ processor = DocumentProcessor()
 def on_startup():
     init_db()
 
-# --- 4. ФУНКЦИИ ---
 def send_whatsapp_message(to_number, body_text):
     try:
         from_number = 'whatsapp:+14155238886'
@@ -83,6 +79,7 @@ def send_whatsapp_message(to_number, body_text):
     except Exception as e:
         logger.error(f"Twilio error: {e}")
 
+# --- ГЛАВНАЯ ЛОГИКА ОБРАБОТКИ ---
 def process_file_task(user_phone, media_url, media_type):
     with Session(engine) as session:
         ext = ".pdf" if media_type == "application/pdf" else ".jpg"
@@ -93,49 +90,77 @@ def process_file_task(user_phone, media_url, media_type):
             response = requests.get(media_url)
             with open(local_path, 'wb') as f: f.write(response.content)
             
-            result = processor.process_and_upload(user_phone, local_path, filename)
+            # ТЕПЕРЬ ПОЛУЧАЕМ СПИСОК РЕЗУЛЬТАТОВ (Page 1, Page 2...)
+            results_list = processor.process_and_upload(user_phone, local_path, filename)
             
-            if result["status"] == "success":
-                client = session.exec(select(Client).where(Client.phone_number == user_phone)).first()
-                if not client:
-                    client = Client(phone_number=user_phone, full_name=result["person"])
-                    session.add(client)
-                elif client.full_name == "Unknown" and result["person"] != "Unknown":
-                    client.full_name = result["person"]
-                    session.add(client)
-                session.commit()
-                session.refresh(client)
+            # Если вернулась фатальная ошибка списка (например, файл битый)
+            if not results_list or (len(results_list) == 1 and results_list[0].get("status") == "error"):
+                 send_whatsapp_message(user_phone, f"⚠️ Ошибка: {results_list[0].get('message')}")
+                 return
 
-                new_doc = Document(client_id=client.id, doc_type=result["doc_type"], file_path=result["filename"])
+            # Перебираем успешные страницы
+            success_pages = [r for r in results_list if r["status"] == "success"]
+            
+            if not success_pages:
+                send_whatsapp_message(user_phone, "⚠️ Не удалось обработать страницы документа.")
+                return
+
+            # Берем имя и тип из первой успешной страницы для клиента
+            first_res = success_pages[0]
+            person_name = first_res["person"]
+            
+            # Обновляем Клиента
+            client = session.exec(select(Client).where(Client.phone_number == user_phone)).first()
+            if not client:
+                client = Client(phone_number=user_phone, full_name=person_name)
+                session.add(client)
+            elif client.full_name == "Unknown" and person_name != "Unknown":
+                client.full_name = person_name
+                session.add(client)
+            session.commit()
+            session.refresh(client)
+
+            # Сохраняем КАЖДУЮ страницу в БД Documents
+            added_types = set()
+            last_link = None
+            
+            for page in success_pages:
+                new_doc = Document(client_id=client.id, doc_type=page["doc_type"], file_path=page["filename"])
                 session.add(new_doc)
-                session.commit()
-                
-                public_link = publish_file(result["remote_path"])
-                
-                existing = {d.doc_type for d in session.exec(select(Document).where(Document.client_id == client.id)).all()}
-                missing = REQUIRED_DOCS - existing
-                
-                msg = f"✅ Принято: {result['doc_type']}\n"
-                msg += f"👤 Досье: {client.full_name}\n"
-                
-                if public_link:
-                    msg += f"🔗 Ссылка: {public_link}\n"
-                
-                if missing:
-                    msg += f"\n⏳ Осталось сдать ({len(missing)}):\n- " + "\n- ".join(missing)
-                else:
-                    msg += "\n🎉 Полный комплект собран!"
-                
-                send_whatsapp_message(user_phone, msg)
+                added_types.add(page["doc_type"])
+                last_link = page["remote_path"] # Запомним последнюю ссылку
+            
+            session.commit()
+            
+            # Генерируем ссылку (на последнюю страницу или папку - пока на файл)
+            # В идеале публиковать папку, но API Диска проще публикует файл.
+            public_link = publish_file(last_link)
+            
+            # Считаем остаток
+            existing = {d.doc_type for d in session.exec(select(Document).where(Document.client_id == client.id)).all()}
+            missing = REQUIRED_DOCS - existing
+            
+            # Формируем отчет
+            msg = f"✅ Принято страниц: {len(success_pages)}\n"
+            msg += f"📄 Тип: {', '.join(added_types)}\n"
+            msg += f"👤 Досье: {client.full_name}\n"
+            
+            if public_link:
+                msg += f"🔗 Ссылка (пример): {public_link}\n"
+            
+            if missing:
+                msg += f"\n⏳ Осталось сдать ({len(missing)}):\n- " + "\n- ".join(missing)
             else:
-                send_whatsapp_message(user_phone, f"⚠️ Ошибка: {result.get('message')}")
+                msg += "\n🎉 Полный комплект собран!"
+            
+            send_whatsapp_message(user_phone, msg)
+
         except Exception as e:
             logger.error(f"Task error: {e}")
             send_whatsapp_message(user_phone, "❌ Сбой обработки.")
         finally:
             if os.path.exists(local_path): os.remove(local_path)
 
-# --- 5. WEBHOOK ---
 @app.post("/whatsapp")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
@@ -158,13 +183,10 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
                 
                 report = f"📂 Досье: {client.full_name}\n✅ Сдано: {len(existing)}\n"
                 if existing: report += f"- " + "\n- ".join(existing) + "\n"
-                
-                if missing:
-                    report += f"\n❌ НУЖНО ДОСЛАТЬ ({len(missing)}):\n- " + "\n- ".join(missing)
-                else:
-                    report += "\n🎉 Всё готово!"
+                if missing: report += f"\n❌ НУЖНО ДОСЛАТЬ ({len(missing)}):\n- " + "\n- ".join(missing)
+                else: report += "\n🎉 Всё готово!"
                 send_whatsapp_message(user_phone, report)
         return "OK"
     
-    send_whatsapp_message(user_phone, "🤖 Пришлите фото документа.")
+    send_whatsapp_message(user_phone, "🤖 Пришлите фото или PDF.")
     return "OK"

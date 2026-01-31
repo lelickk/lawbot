@@ -15,122 +15,142 @@ class DocumentProcessor:
         self.temp_dir = "temp_files"
         os.makedirs(self.temp_dir, exist_ok=True)
 
-    def _fix_exif_orientation(self, image_path):
+    def _fix_exif_orientation_pil(self, img):
+        """Фикс EXIF для объекта PIL Image (не файла)"""
         try:
-            img = Image.open(image_path)
-            img = ImageOps.exif_transpose(img)
-            img.save(image_path)
-        except: pass
+            return ImageOps.exif_transpose(img)
+        except:
+            return img
 
-    def _convert_pdf_to_jpg(self, pdf_path):
-        try:
-            images = convert_from_path(pdf_path)
-            if not images: return None
-            jpg_path = pdf_path.replace(".pdf", "_temp_analysis.jpg")
-            images[0].save(jpg_path, "JPEG")
-            return jpg_path
-        except Exception as e:
-            logger.error(f"PDF->JPG error: {e}")
-            return None
-
-    def _apply_clock_rotation(self, image_path, clock_pos):
-        if clock_pos == "12_oclock": return
+    def _apply_clock_rotation(self, img, clock_pos):
+        """Поворот PIL Image объекта в памяти"""
+        if clock_pos == "12_oclock": return img
+        
         angle_map = {"3_oclock": 90, "6_oclock": 180, "9_oclock": -90}
         angle = angle_map.get(clock_pos, 0)
+        
         if angle:
             try:
-                img = Image.open(image_path)
-                img = img.rotate(angle, expand=True)
-                img.save(image_path)
-            except: pass
-
-    def _convert_jpg_to_pdf(self, jpg_path):
-        try:
-            with open(jpg_path, "rb") as f: pdf_bytes = img2pdf.convert(f.read())
-            pdf_path = os.path.splitext(jpg_path)[0] + ".pdf"
-            with open(pdf_path, "wb") as f: f.write(pdf_bytes)
-            return pdf_path
-        except: return None
+                return img.rotate(angle, expand=True)
+            except Exception as e:
+                logger.error(f"Rotation error: {e}")
+        return img
 
     def _encode_image(self, path):
         with open(path, "rb") as f: return base64.b64encode(f.read()).decode('utf-8')
 
     def process_and_upload(self, user_phone, local_path, original_filename):
-        ai_input_path = None
-        final_upload_path = None
-        is_pdf_input = local_path.lower().endswith(".pdf")
+        """
+        Возвращает СПИСОК результатов, так как страниц может быть много.
+        Пример: [{'status': 'success', 'doc_type':...}, {...}]
+        """
+        is_pdf = local_path.lower().endswith(".pdf")
+        processed_results = []
         
-        # 1. Fix EXIF
-        if not is_pdf_input: self._fix_exif_orientation(local_path)
-
+        # 1. Получаем список изображений (страниц)
+        pil_images = []
         try:
-            # Prep for AI
-            ai_input_path = self._convert_pdf_to_jpg(local_path) if is_pdf_input else local_path
-            if not ai_input_path: raise Exception("File prep failed")
-
-            # 2. AI Analysis
-            doc_data = {"doc_type": "Document", "person_name": "Unknown", "top_position": "12_oclock"}
-            try:
-                base64_img = self._encode_image(ai_input_path)
-                prompt = """
-                Analyze for Israeli Ministry of Interior.
-                TASK 1: Orientation (Clock Face). Where is the TOP of text? 
-                (12_oclock, 3_oclock, 6_oclock, 9_oclock).
-                TASK 2: Classify: ID_Document, Passport, Birth_Certificate, Marriage_Certificate, 
-                Police_Clearance, Bank_Statement, Salary_Slip, Rental_Contract, Utility_Bill, etc.
-                TASK 3: Extract Name (Latin).
-                JSON: {"doc_type": "...", "person_name": "...", "top_position": "..."}
-                """
-                res = analyze_document(base64_img, prompt)
-                if res: doc_data = res
-            except Exception as e: logger.error(f"AI error: {e}")
-
-            # 3. Rotate
-            if not is_pdf_input: self._apply_clock_rotation(local_path, doc_data.get("top_position"))
-
-            # 4. Convert to PDF
-            final_upload_path = local_path
-            if not is_pdf_input:
-                pdf = self._convert_jpg_to_pdf(local_path)
-                if pdf: final_upload_path = pdf
-
-            # 5. Paths & Naming
-            person = "".join(c for c in doc_data.get('person_name', 'Client') if c.isalnum() or c in ' _-').strip()
-            # Базовая папка клиента
-            base_folder = f"/Clients/{user_phone}/{person or 'Client'}"
-            
-            date_s = datetime.now().strftime("%Y-%m-%d")
-            dtype = doc_data.get('doc_type', 'Doc')
-
-            # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
-            # Путь для чистовика (в корне папки клиента)
-            remote_pdf = f"{base_folder}/{date_s}_{dtype}.pdf"
-            
-            # Путь для оригинала (в подпапке Originals)
-            orig_ext = os.path.splitext(local_path)[1] or ".jpg"
-            remote_orig = f"{base_folder}/Originals/{date_s}_{dtype}_orig{orig_ext}"
-            # -----------------------
-
-            # 6. Upload
-            # Загружаем ОРИГИНАЛ в папку Originals
-            try:
-                upload_file_to_disk(local_path, remote_orig)
-            except Exception as e:
-                logger.error(f"Failed to upload original file: {e}")
-            
-            # Загружаем ЧИСТОВИК (PDF) в корень
-            success = upload_file_to_disk(final_upload_path, remote_pdf)
-
-            # Cleanup
-            for p in {local_path, ai_input_path, final_upload_path}:
-                if p and os.path.exists(p) and "temp_files" in p: os.remove(p)
-
-            if success:
-                return {
-                    "status": "success", "doc_type": dtype, "person": person, 
-                    "filename": remote_pdf, "remote_path": remote_pdf
-                }
-            return {"status": "error", "message": "Upload failed"}
-
+            if is_pdf:
+                # Конвертируем все страницы PDF в картинки
+                pil_images = convert_from_path(local_path)
+            else:
+                # Если это картинка, открываем и сразу фиксим EXIF
+                img = Image.open(local_path)
+                img = self._fix_exif_orientation_pil(img)
+                pil_images = [img]
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return [{"status": "error", "message": f"File read error: {e}"}]
+
+        if not pil_images:
+            return [{"status": "error", "message": "No images found"}]
+
+        # Флаг, чтобы загрузить исходный файл (Оригинал) только 1 раз
+        source_file_uploaded = False
+
+        # 2. Цикл по страницам
+        for i, img in enumerate(pil_images, start=1):
+            page_suffix = f"_page{i}" # _page1, _page2
+            
+            # Временный файл для анализа текущей страницы
+            temp_page_jpg = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}.jpg")
+            img.save(temp_page_jpg, "JPEG")
+            
+            final_pdf_path = None
+            
+            try:
+                # --- АНАЛИЗ ИИ (Для каждой страницы отдельно!) ---
+                # Ведь страница 2 может быть перевернута, даже если страница 1 нормальная
+                doc_data = {"doc_type": "Document", "person_name": "Unknown", "top_position": "12_oclock"}
+                try:
+                    base64_img = self._encode_image(temp_page_jpg)
+                    prompt = """
+                    Analyze document page for Israeli Ministry of Interior.
+                    TASK 1: Orientation. Where is the TOP of text? (12_oclock, 3_oclock, 6_oclock, 9_oclock).
+                    TASK 2: Classify. ID_Document, Passport, Birth_Certificate, Marriage_Certificate, 
+                    Police_Clearance, Bank_Statement, Salary_Slip, Rental_Contract, Utility_Bill, etc.
+                    TASK 3: Extract Name (Latin).
+                    JSON: {"doc_type": "...", "person_name": "...", "top_position": "..."}
+                    """
+                    res = analyze_document(base64_img, prompt)
+                    if res: doc_data = res
+                except Exception as e:
+                    logger.error(f"AI error on page {i}: {e}")
+
+                # --- ПОВОРОТ (В памяти) ---
+                rotated_img = self._apply_clock_rotation(img, doc_data.get("top_position"))
+                
+                # --- СОХРАНЕНИЕ СТРАНИЦЫ В PDF (Чистовик) ---
+                final_pdf_path = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}_final.pdf")
+                
+                # Сохраняем повернутую картинку во временный буфер, чтобы сделать PDF
+                temp_rot_jpg = temp_page_jpg.replace(".jpg", "_rot.jpg")
+                rotated_img.save(temp_rot_jpg, "JPEG")
+                
+                with open(temp_rot_jpg, "rb") as f:
+                    pdf_bytes = img2pdf.convert(f.read())
+                with open(final_pdf_path, "wb") as f:
+                    f.write(pdf_bytes)
+                
+                # Удаляем промежуточный rot_jpg
+                if os.path.exists(temp_rot_jpg): os.remove(temp_rot_jpg)
+
+                # --- ФОРМИРОВАНИЕ ПУТЕЙ ---
+                person = "".join(c for c in doc_data.get('person_name', 'Client') if c.isalnum() or c in ' _-').strip()
+                base_folder = f"/Clients/{user_phone}/{person or 'Client'}"
+                date_s = datetime.now().strftime("%Y-%m-%d")
+                dtype = doc_data.get('doc_type', 'Doc')
+
+                # Имя файла: Date_Type_pageN.pdf
+                remote_filename = f"{date_s}_{dtype}{page_suffix}.pdf"
+                remote_path_pdf = f"{base_folder}/{remote_filename}"
+
+                # --- ЗАГРУЗКА ИСХОДНИКА (Только 1 раз) ---
+                # Мы загружаем весь исходный файл (даже если он многостраничный) в Originals
+                if not source_file_uploaded:
+                    orig_ext = os.path.splitext(local_path)[1] or ".jpg"
+                    # Имя оригинала: Date_Type_Source_orig.pdf
+                    remote_orig = f"{base_folder}/Originals/{date_s}_{dtype}_Source_orig{orig_ext}"
+                    try:
+                        upload_file_to_disk(local_path, remote_orig)
+                        source_file_uploaded = True
+                    except Exception as e:
+                        logger.error(f"Failed source upload: {e}")
+
+                # --- ЗАГРУЗКА СТРАНИЦЫ ---
+                if upload_file_to_disk(final_pdf_path, remote_path_pdf):
+                    processed_results.append({
+                        "status": "success",
+                        "doc_type": dtype,
+                        "person": person,
+                        "filename": remote_filename,
+                        "remote_path": remote_path_pdf
+                    })
+                else:
+                    processed_results.append({"status": "error", "message": f"Upload failed page {i}"})
+
+            finally:
+                # Чистка временных файлов страницы
+                for p in {temp_page_jpg, final_pdf_path}:
+                    if p and os.path.exists(p): os.remove(p)
+
+        return processed_results
