@@ -6,7 +6,7 @@ import hmac
 from fastapi import FastAPI, Request, BackgroundTasks
 from twilio.rest import Client as TwilioClient
 from services.doc_processor import DocumentProcessor
-from services.yandex_disk import publish_file
+from services.storage import publish_file
 from dotenv import load_dotenv
 from sqlmodel import Session, select
 from database import init_db, engine, Client, Document
