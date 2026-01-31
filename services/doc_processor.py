@@ -60,15 +60,15 @@ class DocumentProcessor:
         final_upload_path = None
         is_pdf_input = local_path.lower().endswith(".pdf")
         
-        # 1. Сначала фиксим EXIF (если картинка), чтобы ИИ видел как есть
+        # 1. Fix EXIF
         if not is_pdf_input: self._fix_exif_orientation(local_path)
 
         try:
-            # Подготовка для ИИ
+            # Prep for AI
             ai_input_path = self._convert_pdf_to_jpg(local_path) if is_pdf_input else local_path
             if not ai_input_path: raise Exception("File prep failed")
 
-            # 2. Анализ ИИ (Часы + Список документов)
+            # 2. AI Analysis
             doc_data = {"doc_type": "Document", "person_name": "Unknown", "top_position": "12_oclock"}
             try:
                 base64_img = self._encode_image(ai_input_path)
@@ -85,36 +85,43 @@ class DocumentProcessor:
                 if res: doc_data = res
             except Exception as e: logger.error(f"AI error: {e}")
 
-            # 3. Поворот
+            # 3. Rotate
             if not is_pdf_input: self._apply_clock_rotation(local_path, doc_data.get("top_position"))
 
-            # 4. Конвертация в PDF (чистовик)
+            # 4. Convert to PDF
             final_upload_path = local_path
             if not is_pdf_input:
                 pdf = self._convert_jpg_to_pdf(local_path)
                 if pdf: final_upload_path = pdf
 
-            # 5. Пути и Имена
+            # 5. Paths & Naming
             person = "".join(c for c in doc_data.get('person_name', 'Client') if c.isalnum() or c in ' _-').strip()
-            folder = f"/Clients/{user_phone}/{person or 'Client'}"
+            # Базовая папка клиента
+            base_folder = f"/Clients/{user_phone}/{person or 'Client'}"
+            
             date_s = datetime.now().strftime("%Y-%m-%d")
             dtype = doc_data.get('doc_type', 'Doc')
 
-            # Имя чистовика (PDF)
-            remote_pdf = f"{folder}/{date_s}_{dtype}.pdf"
+            # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
+            # Путь для чистовика (в корне папки клиента)
+            remote_pdf = f"{base_folder}/{date_s}_{dtype}.pdf"
             
-            # Имя оригинала (JPG или исходный PDF)
+            # Путь для оригинала (в подпапке Originals)
             orig_ext = os.path.splitext(local_path)[1] or ".jpg"
-            remote_orig = f"{folder}/{date_s}_{dtype}_orig{orig_ext}"
+            remote_orig = f"{base_folder}/Originals/{date_s}_{dtype}_orig{orig_ext}"
+            # -----------------------
 
-            # 6. ЗАГРУЗКА (Сначала оригинал, потом чистовик)
-            # Оригинал: загружаем local_path (он может быть повернут по EXIF, но это даже лучше)
-            upload_file_to_disk(local_path, remote_orig)
+            # 6. Upload
+            # Загружаем ОРИГИНАЛ в папку Originals
+            try:
+                upload_file_to_disk(local_path, remote_orig)
+            except Exception as e:
+                logger.error(f"Failed to upload original file: {e}")
             
-            # Чистовик
+            # Загружаем ЧИСТОВИК (PDF) в корень
             success = upload_file_to_disk(final_upload_path, remote_pdf)
 
-            # Чистка
+            # Cleanup
             for p in {local_path, ai_input_path, final_upload_path}:
                 if p and os.path.exists(p) and "temp_files" in p: os.remove(p)
 
