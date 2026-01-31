@@ -27,7 +27,6 @@ class DocumentProcessor:
     def _convert_pdf_to_jpg(self, pdf_path):
         try:
             # DPI=300 для высокого качества. 
-            # Размер будет большим, но мы обрежем лишнее, и итоговый файл будет нормальным.
             images = convert_from_path(pdf_path, dpi=300)
             if not images: return None
             return images
@@ -53,18 +52,13 @@ class DocumentProcessor:
         """
         Упорядочивает координаты 4 точек в порядке:
         Top-Left, Top-Right, Bottom-Right, Bottom-Left.
-        Необходимо для правильной "натяжки" перспективы.
         """
         rect = np.zeros((4, 2), dtype="float32")
         
-        # Top-Left: минимальная сумма (x+y)
-        # Bottom-Right: максимальная сумма (x+y)
         s = pts.sum(axis=1)
         rect[0] = pts[np.argmin(s)]
         rect[2] = pts[np.argmax(s)]
         
-        # Top-Right: минимальная разница (x-y)
-        # Bottom-Left: максимальная разница (x-y)
         diff = np.diff(pts, axis=1)
         rect[1] = pts[np.argmin(diff)]
         rect[3] = pts[np.argmax(diff)]
@@ -73,30 +67,25 @@ class DocumentProcessor:
 
     def _four_point_transform(self, image, pts):
         """
-        Выполняет перспективную трансформацию (вырезает и выпрямляет документ).
-        Аналог функции Scan в мобильных приложениях.
+        Выполняет перспективную трансформацию.
         """
         rect = self._order_points(pts)
         (tl, tr, br, bl) = rect
 
-        # Вычисляем ширину нового изображения (максимальное расстояние между точками по горизонтали)
         widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
         widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
         maxWidth = max(int(widthA), int(widthB))
 
-        # Вычисляем высоту нового изображения
         heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
         heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
         maxHeight = max(int(heightA), int(heightB))
 
-        # Матрица координат назначения (идеальный прямоугольник)
         dst = np.array([
             [0, 0],
             [maxWidth - 1, 0],
             [maxWidth - 1, maxHeight - 1],
             [0, maxHeight - 1]], dtype="float32")
 
-        # Вычисляем матрицу трансформации и применяем её
         M = cv2.getPerspectiveTransform(rect, dst)
         warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
 
@@ -104,13 +93,10 @@ class DocumentProcessor:
 
     def _smart_crop(self, pil_image):
         """
-        Продвинутая обрезка (Scan-like behavior):
-        1. Ищет контуры на уменьшенной копии.
-        2. Находит 4 угла документа.
-        3. Применяет Perspective Transform к оригиналу высокого качества.
+        Продвинутая обрезка (Scan-like behavior).
         """
         try:
-            # 1. Конвертация PIL -> OpenCV (RGB -> BGR)
+            # 1. Конвертация PIL -> OpenCV
             full_img_cv = np.array(pil_image)
             if len(full_img_cv.shape) == 3:
                 full_img_cv = full_img_cv[:, :, ::-1].copy()
@@ -119,8 +105,7 @@ class DocumentProcessor:
 
             h_orig, w_orig = full_img_cv.shape[:2]
 
-            # 2. Масштабирование (Resize) для быстрого и точного поиска контуров
-            # Работаем с высотой 800px - это золотая середина для Canny Edge
+            # 2. Масштабирование
             target_h = 800.0
             scale = target_h / float(h_orig)
             w_small = int(w_orig * scale)
@@ -130,19 +115,14 @@ class DocumentProcessor:
 
             # 3. Препроцессинг
             gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
-            # Размытие (убираем шум ковра/стола)
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            
-            # Детекция границ Canny
             edged = cv2.Canny(blurred, 75, 200)
             
-            # Дилатация + Эрозия (Morph Close) - закрываем пробелы в линиях контура
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
             closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
 
             # 4. Поиск контуров
             contours, _ = cv2.findContours(closed.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-            # Сортируем от больших к маленьким, берем топ-5 кандидатов
             contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
 
             screenCnt = None
@@ -150,34 +130,31 @@ class DocumentProcessor:
             # 5. Ищем полигон с 4 углами
             for c in contours:
                 peri = cv2.arcLength(c, True)
-                # Аппроксимация контура (упрощение линий)
                 approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-
-                # Если точек 4 — это наш идеальный документ
                 if len(approx) == 4:
                     screenCnt = approx
                     break
 
-            # Фолбэк: Если 4 угла не нашли (например, углы скруглены),
-            # берем MinAreaRect самого большого контура
+            # Фолбэк: Если 4 угла не нашли
             if screenCnt is None and len(contours) > 0:
                 rect = cv2.minAreaRect(contours[0])
                 box = cv2.boxPoints(rect)
-                screenCnt = np.int0(box)
+                # --- ИСПРАВЛЕНИЕ ЗДЕСЬ (np.int0 -> np.int64) ---
+                screenCnt = np.int64(box) 
+                # -----------------------------------------------
 
             if screenCnt is None:
                 logger.warning("SmartCrop: No document contour found.")
                 return pil_image
 
-            # 6. Масштабируем найденные координаты обратно к ОРИГИНАЛУ
-            # screenCnt имеет размерность (4, 1, 2), приводим к (4, 2)
+            # 6. Масштабируем
             screenCnt = screenCnt.reshape(4, 2)
             original_pts = screenCnt.astype("float32") / scale
 
-            # 7. Применяем перспективную проекцию к большому оригиналу
+            # 7. Трансформация
             warped_cv = self._four_point_transform(full_img_cv, original_pts)
 
-            # 8. Конвертируем обратно в PIL (BGR -> RGB)
+            # 8. Обратно в PIL
             warped_pil = Image.fromarray(cv2.cvtColor(warped_cv, cv2.COLOR_BGR2RGB))
             
             logger.info("SmartCrop: Perspective Transform applied successfully.")
@@ -185,7 +162,7 @@ class DocumentProcessor:
 
         except Exception as e:
             logger.error(f"Smart crop failed: {e}")
-            return pil_image # В случае ошибки возвращаем оригинал
+            return pil_image 
 
     def _encode_image(self, path):
         with open(path, "rb") as f: return base64.b64encode(f.read()).decode('utf-8')
@@ -197,7 +174,6 @@ class DocumentProcessor:
         pil_images = []
         try:
             if is_pdf:
-                # DPI=300
                 pil_images = self._convert_pdf_to_jpg(local_path)
             else:
                 img = Image.open(local_path)
@@ -214,7 +190,6 @@ class DocumentProcessor:
         for i, img in enumerate(pil_images, start=1):
             page_suffix = f"_page{i}"
             
-            # Временный файл (в высоком разрешении)
             temp_page_jpg = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}.jpg")
             img.save(temp_page_jpg, "JPEG", quality=95)
             
@@ -238,17 +213,15 @@ class DocumentProcessor:
                 except Exception as e:
                     logger.error(f"AI error on page {i}: {e}")
 
-                # --- 1. ПОВОРОТ (Грубый поворот на 90/180) ---
+                # --- 1. ПОВОРОТ ---
                 rotated_img = self._apply_clock_rotation(img, doc_data.get("top_position"))
                 
                 # --- 2. ОБРЕЗКА (Perspective Crop) ---
-                # Теперь ищем углы и выпрямляем документ
                 final_img = self._smart_crop(rotated_img)
 
                 # --- СОХРАНЕНИЕ ---
                 final_pdf_path = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}_final.pdf")
                 
-                # Сохраняем финальную картинку перед PDF конвертацией
                 temp_final_jpg = temp_page_jpg.replace(".jpg", "_final.jpg")
                 final_img.save(temp_final_jpg, "JPEG", quality=95)
                 
@@ -268,7 +241,7 @@ class DocumentProcessor:
                 remote_filename = f"{date_s}_{dtype}{page_suffix}.pdf"
                 remote_path_pdf = f"{base_folder}/{remote_filename}"
 
-                # --- ЗАГРУЗКА ИСХОДНИКА (Один раз) ---
+                # --- ЗАГРУЗКА ИСХОДНИКА ---
                 if not source_file_uploaded:
                     orig_ext = os.path.splitext(local_path)[1] or ".jpg"
                     remote_orig = f"{base_folder}/Originals/{date_s}_{dtype}_Source_orig{orig_ext}"
