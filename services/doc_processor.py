@@ -2,8 +2,8 @@ import os
 import logging
 import base64
 import img2pdf
-import cv2  # <--- Добавили OpenCV
-import numpy as np # <--- Добавили Numpy
+import cv2
+import numpy as np
 from datetime import datetime
 from PIL import Image, ImageOps
 from pdf2image import convert_from_path
@@ -26,7 +26,7 @@ class DocumentProcessor:
 
     def _convert_pdf_to_jpg(self, pdf_path):
         try:
-            # --- ИЗМЕНЕНИЕ: DPI=300 для высокого качества ---
+            # DPI=300 для высокого качества распознавания и обрезки
             images = convert_from_path(pdf_path, dpi=300)
             if not images: return None
             # Возвращаем список PIL объектов (страниц)
@@ -51,66 +51,84 @@ class DocumentProcessor:
 
     def _smart_crop(self, pil_image):
         """
-        Умная обрезка краев с помощью OpenCV.
-        1. Конвертируем в формат OpenCV.
-        2. Ищем контуры документа.
-        3. Обрезаем лишний фон.
+        Умная обрезка с масштабированием (Robust Smart Crop).
+        Работает с любым DPI, так как анализ идет на уменьшенной копии.
         """
         try:
-            # Конвертация PIL -> OpenCV (RGB -> BGR)
-            open_cv_image = np.array(pil_image) 
-            # Если изображение черно-белое, shape будет (H, W), иначе (H, W, 3)
-            if len(open_cv_image.shape) == 3:
-                open_cv_image = open_cv_image[:, :, ::-1].copy()
+            # 1. Конвертация в OpenCV
+            full_img_cv = np.array(pil_image)
+            if len(full_img_cv.shape) == 3:
+                full_img_cv = full_img_cv[:, :, ::-1].copy() # RGB -> BGR
             else:
-                # Если вдруг пришло grayscale, конвертируем в BGR для унификации
-                open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_GRAY2BGR)
+                full_img_cv = cv2.cvtColor(full_img_cv, cv2.COLOR_GRAY2BGR)
 
-            # Грейскейл для анализа
-            gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
-            # Размытие (убираем шум)
+            h_orig, w_orig = full_img_cv.shape[:2]
+
+            # 2. Масштабирование для анализа (Speed + Stability)
+            # Сжимаем до высоты 800px, чтобы параметры OpenCV работали предсказуемо
+            target_h = 800
+            scale = target_h / float(h_orig)
+            w_small = int(w_orig * scale)
+            h_small = int(h_orig * scale)
+            
+            small_img = cv2.resize(full_img_cv, (w_small, h_small), interpolation=cv2.INTER_AREA)
+
+            # 3. Препроцессинг (на маленькой копии)
+            gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
+            # Размытие, чтобы убрать шум бумаги
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
             
-            # Пороговое преобразование (Threshold) - ищем белое на темном
-            # Otsu отлично находит баланс между бумагой и столом
-            _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Canny Edge Detection (лучше находит границы листа)
+            edges = cv2.Canny(blur, 50, 150)
+            
+            # Дилатация (расширение), чтобы замкнуть контур листа
+            # Делаем границы "жирными", чтобы точно найти прямоугольник
+            kernel = np.ones((5, 5), np.uint8)
+            dilated = cv2.dilate(edges, kernel, iterations=2)
 
-            # Морфология (закрываем дырки в буквах, чтобы получить сплошной контур листа)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-            morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-
-            # Ищем контуры
-            contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # 4. Поиск контуров
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
             if not contours:
-                return pil_image # Если не нашли, возвращаем как есть
-
-            # Берем самый большой контур (это и есть наш лист бумаги)
-            largest_contour = max(contours, key=cv2.contourArea)
-
-            # Получаем прямоугольник вокруг контура (x, y, w, h)
-            x, y, w, h = cv2.boundingRect(largest_contour)
-
-            # Проверка: если контур слишком маленький (мусор), не обрезаем
-            img_h, img_w = open_cv_image.shape[:2]
-            if w * h < (img_w * img_h) * 0.1: # Если меньше 10% площади, это ошибка
+                logger.warning("SmartCrop: No contours found.")
                 return pil_image
 
-            # Добавляем небольшой отступ (padding), чтобы не резать буквы по живому
-            padding = 15 # пикселей
+            # Берем самый большой по площади контур
+            largest_contour = max(contours, key=cv2.contourArea)
+            
+            # 5. Получаем координаты (на маленькой картинке)
+            x_small, y_small, w_small_rect, h_small_rect = cv2.boundingRect(largest_contour)
+
+            # Проверка: если нашли что-то слишком мелкое (меньше 5% картинки), это ошибка
+            area_small = w_small_rect * h_small_rect
+            total_area_small = w_small * h_small
+            if area_small < total_area_small * 0.05:
+                logger.warning(f"SmartCrop: Contour too small ({area_small}/{total_area_small}). Skipping.")
+                return pil_image
+
+            # 6. Масштабируем координаты обратно к оригиналу (300 DPI)
+            x = int(x_small / scale)
+            y = int(y_small / scale)
+            w = int(w_small_rect / scale)
+            h = int(h_small_rect / scale)
+
+            # Добавляем небольшой отступ (Padding), чтобы не срезать края текста
+            # На большом разрешении 30px - это немного
+            padding = 30 
             x = max(0, x - padding)
             y = max(0, y - padding)
-            w = min(img_w - x, w + 2 * padding)
-            h = min(img_h - y, h + 2 * padding)
+            w = min(w_orig - x, w + 2 * padding)
+            h = min(h_orig - y, h + 2 * padding)
 
-            # Обрезаем
+            logger.info(f"SmartCrop Applied: x={x}, y={y}, w={w}, h={h} (Scale: {scale:.4f})")
+            
+            # 7. Режем оригинал
             cropped = pil_image.crop((x, y, x + w, y + h))
-            logger.info(f"Smart Cropped: x={x}, y={y}, w={w}, h={h}")
             return cropped
 
         except Exception as e:
             logger.error(f"Smart crop failed: {e}")
-            return pil_image # При ошибке возвращаем оригинал
+            return pil_image
 
     def _encode_image(self, path):
         with open(path, "rb") as f: return base64.b64encode(f.read()).decode('utf-8')
@@ -168,7 +186,7 @@ class DocumentProcessor:
                 rotated_img = self._apply_clock_rotation(img, doc_data.get("top_position"))
                 
                 # --- 2. ОБРЕЗКА (Smart Crop) ---
-                # Теперь, когда документ ровный, обрезаем поля стола
+                # Теперь, когда документ ровный, обрезаем поля стола с учетом масштаба
                 final_img = self._smart_crop(rotated_img)
 
                 # --- СОХРАНЕНИЕ ---
