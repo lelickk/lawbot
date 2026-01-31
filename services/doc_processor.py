@@ -26,7 +26,7 @@ class DocumentProcessor:
 
     def _convert_pdf_to_jpg(self, pdf_path):
         try:
-            # DPI=300 для высокого качества. 
+            # DPI=300 для высокого качества
             images = convert_from_path(pdf_path, dpi=300)
             if not images: return None
             return images
@@ -49,10 +49,7 @@ class DocumentProcessor:
         return img
 
     def _order_points(self, pts):
-        """
-        Упорядочивает координаты 4 точек в порядке:
-        Top-Left, Top-Right, Bottom-Right, Bottom-Left.
-        """
+        """Упорядочивает координаты 4 точек (TL, TR, BR, BL)"""
         rect = np.zeros((4, 2), dtype="float32")
         
         s = pts.sum(axis=1)
@@ -66,9 +63,7 @@ class DocumentProcessor:
         return rect
 
     def _four_point_transform(self, image, pts):
-        """
-        Выполняет перспективную трансформацию.
-        """
+        """Перспективная трансформация (выравнивание документа)"""
         rect = self._order_points(pts)
         (tl, tr, br, bl) = rect
 
@@ -105,7 +100,7 @@ class DocumentProcessor:
 
             h_orig, w_orig = full_img_cv.shape[:2]
 
-            # 2. Масштабирование
+            # 2. Масштабирование (работаем с высотой 800px)
             target_h = 800.0
             scale = target_h / float(h_orig)
             w_small = int(w_orig * scale)
@@ -135,19 +130,19 @@ class DocumentProcessor:
                     screenCnt = approx
                     break
 
-            # Фолбэк: Если 4 угла не нашли
+            # Фолбэк: Если 4 угла не нашли, берем MinAreaRect
             if screenCnt is None and len(contours) > 0:
                 rect = cv2.minAreaRect(contours[0])
                 box = cv2.boxPoints(rect)
-                # --- ИСПРАВЛЕНИЕ ЗДЕСЬ (np.int0 -> np.int64) ---
-                screenCnt = np.int64(box) 
-                # -----------------------------------------------
+                # !!! ИСПРАВЛЕНИЕ: np.int32 вместо устаревшего np.int0 !!!
+                screenCnt = np.int32(box)
+                # --------------------------------------------------------
 
             if screenCnt is None:
                 logger.warning("SmartCrop: No document contour found.")
                 return pil_image
 
-            # 6. Масштабируем
+            # 6. Масштабируем точки обратно к оригиналу
             screenCnt = screenCnt.reshape(4, 2)
             original_pts = screenCnt.astype("float32") / scale
 
@@ -216,7 +211,7 @@ class DocumentProcessor:
                 # --- 1. ПОВОРОТ ---
                 rotated_img = self._apply_clock_rotation(img, doc_data.get("top_position"))
                 
-                # --- 2. ОБРЕЗКА (Perspective Crop) ---
+                # --- 2. ОБРЕЗКА (Smart Crop) ---
                 final_img = self._smart_crop(rotated_img)
 
                 # --- СОХРАНЕНИЕ ---
