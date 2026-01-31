@@ -27,24 +27,27 @@ def _get_dropbox_client():
 def upload_file_to_cloud(local_path, remote_path):
     """
     Универсальная функция загрузки.
-    remote_path должен быть полным: /Clients/+7999/Name/file.pdf
     """
     if PROVIDER == "dropbox":
         return _upload_to_dropbox(local_path, remote_path)
     else:
         return _upload_to_yandex(local_path, remote_path)
 
+def publish_file(remote_path):
+    """
+    Создает публичную ссылку на файл.
+    """
+    if PROVIDER == "dropbox":
+        return _publish_dropbox(remote_path)
+    else:
+        return _publish_yandex(remote_path)
+
 # --- YANDEX LOGIC ---
 def _upload_to_yandex(local_path, remote_path):
     y = _get_yandex_client()
     if not y: return False
-
     try:
-        # Создаем папки рекурсивно (если их нет)
         folder_path = os.path.dirname(remote_path)
-        # Яндекс требует создавать каждую папку по очереди, но yadisk умеет это делать? 
-        # Проще пройтись циклом, но yadisk.mkdir не рекурсивен.
-        # Упрощенная логика создания папок:
         parts = folder_path.strip("/").split("/")
         current_path = ""
         for part in parts:
@@ -54,7 +57,6 @@ def _upload_to_yandex(local_path, remote_path):
                 except: pass
 
         if y.exists(remote_path):
-            logger.info(f"File {remote_path} exists, overwriting...")
             y.remove(remote_path)
 
         y.upload(local_path, remote_path)
@@ -64,29 +66,52 @@ def _upload_to_yandex(local_path, remote_path):
         logger.error(f"Yandex Upload Error: {e}")
         return False
 
+def _publish_yandex(remote_path):
+    y = _get_yandex_client()
+    if not y: return None
+    try:
+        if not y.exists(remote_path): return None
+        # Проверяем, может уже опубликовано
+        meta = y.get_meta(remote_path)
+        if meta.public_url:
+            return meta.public_url
+        
+        y.publish(remote_path)
+        meta = y.get_meta(remote_path)
+        return meta.public_url
+    except Exception as e:
+        logger.error(f"Yandex Publish Error: {e}")
+        return None
+
 # --- DROPBOX LOGIC ---
 def _upload_to_dropbox(local_path, remote_path):
     dbx = _get_dropbox_client()
     if not dbx: return False
-
     try:
-        # Dropbox требует слэш в начале
-        if not remote_path.startswith('/'):
-            remote_path = '/' + remote_path
-
+        if not remote_path.startswith('/'): remote_path = '/' + remote_path
         with open(local_path, 'rb') as f:
-            # WriteMode.overwrite перезапишет файл, если он есть
-            dbx.files_upload(
-                f.read(), 
-                remote_path, 
-                mode=WriteMode('overwrite')
-            )
-        
+            dbx.files_upload(f.read(), remote_path, mode=WriteMode('overwrite'))
         logger.info(f"✅ Uploaded to Dropbox: {remote_path}")
         return True
-    except ApiError as e:
-        logger.error(f"Dropbox API Error: {e}")
+    except Exception as e:
+        logger.error(f"Dropbox Upload Error: {e}")
         return False
+
+def _publish_dropbox(remote_path):
+    dbx = _get_dropbox_client()
+    if not dbx: return None
+    try:
+        if not remote_path.startswith('/'): remote_path = '/' + remote_path
+        # Создаем публичную ссылку
+        link_metadata = dbx.sharing_create_shared_link_with_settings(remote_path)
+        return link_metadata.url
+    except ApiError as e:
+        # Если ссылка уже существует
+        if e.error.is_shared_link_already_exists():
+            links = dbx.sharing_list_shared_links(path=remote_path, direct_only=True).links
+            if links: return links[0].url
+        logger.error(f"Dropbox Publish Error: {e}")
+        return None
     except Exception as e:
         logger.error(f"Dropbox Generic Error: {e}")
-        return False
+        return None
