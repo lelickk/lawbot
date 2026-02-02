@@ -37,32 +37,30 @@ class DocumentProcessor:
     def _google_vision_process(self, pil_image, check_rotation=True):
         """
         Возвращает: (processed_image, extracted_text)
-        check_rotation=True: проверяем угол и вращаем.
-        check_rotation=False: только кропаем (второй проход).
+        check_rotation=True: первый проход (выравнивание).
+        check_rotation=False: второй проход (обрезка).
         """
         extracted_text = ""
         try:
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format='JPEG')
             content = img_byte_arr.getvalue()
-
             image = vision.Image(content=content)
             
-            # ЗАПРОС К GOOGLE
             response = self.vision_client.document_text_detection(image=image)
             
             if response.error.message:
                 logger.error(f"Google Error: {response.error.message}")
                 return pil_image, ""
 
-            # 1. Забираем текст
             if response.full_text_annotation:
                 extracted_text = response.full_text_annotation.text
 
-            # 2. Логика поворота (Только в первом проходе)
+            # --- ЛОГИКА ТОЧНОГО ПОВОРОТА (DESKEW) ---
             if check_rotation and response.full_text_annotation.pages:
                 page = response.full_text_annotation.pages[0]
                 if page.blocks:
+                    # Считаем точный угол по первому слову
                     word = page.blocks[0].paragraphs[0].words[0]
                     v = word.bounding_box.vertices
                     dx = v[1].x - v[0].x
@@ -70,24 +68,19 @@ class DocumentProcessor:
                     import math
                     rotation_angle = math.degrees(math.atan2(dy, dx))
                     
-                    final_rotation = 0
-                    if 45 <= rotation_angle < 135: final_rotation = 90
-                    elif -135 < rotation_angle <= -45: final_rotation = -90
-                    elif rotation_angle >= 135 or rotation_angle <= -135: final_rotation = 180
-                    
-                    if final_rotation != 0:
-                        logger.info(f"🔄 Applying rotation {final_rotation} (Detected: {rotation_angle:.2f})")
-                        if final_rotation == 90: pil_image = pil_image.rotate(90, expand=True)
-                        elif final_rotation == -90: pil_image = pil_image.rotate(-90, expand=True)
-                        elif final_rotation == 180: pil_image = pil_image.rotate(180, expand=True)
+                    # Если угол значительный (> 0.5 градуса), выравниваем
+                    # PIL вращает против часовой, поэтому используем -rotation_angle
+                    if abs(rotation_angle) > 0.5:
+                        logger.info(f"📐 Deskewing image by {-rotation_angle:.2f} degrees (Detected: {rotation_angle:.2f})")
                         
-                        # --- RE-SCAN TRICK ---
-                        # Мы повернули фото. Координаты Гугла теперь неверны.
-                        # Запускаем анализ заново для повернутого фото, но запрещаем вращать снова.
+                        # fillcolor='white' чтобы углы после поворота были белыми, а не черными
+                        pil_image = pil_image.rotate(-rotation_angle, expand=True, resample=Image.BICUBIC, fillcolor='white')
+                        
+                        # ВАЖНО: Рекурсивный вызов для обрезки уже ровного фото
                         logger.info("🔄 Image rotated. Re-scanning for precise crop...")
                         return self._google_vision_process(pil_image, check_rotation=False)
 
-            # 3. Логика обрезки (Crop)
+            # --- ЛОГИКА ОБРЕЗКИ (CROP) ---
             if response.full_text_annotation:
                 min_x, min_y = 10000, 10000
                 max_x, max_y = 0, 0
@@ -101,7 +94,8 @@ class DocumentProcessor:
                             max_x = max(max_x, point.x)
                             max_y = max(max_y, point.y)
                 
-                pad = 30
+                # Добавляем небольшие поля
+                pad = 20
                 w_orig, h_orig = pil_image.size
                 min_x = max(0, min_x - pad)
                 min_y = max(0, min_y - pad)
@@ -111,21 +105,16 @@ class DocumentProcessor:
                 area_crop = (max_x - min_x) * (max_y - min_y)
                 area_total = w_orig * h_orig
                 
-                # Защита от деления на ноль, если картинка пустая
                 if area_total > 0:
                     ratio = area_crop / area_total
-                    logger.info(f"📐 Text Coverage: {ratio:.1%}")
+                    logger.info(f"📊 Text Coverage: {ratio:.1%}")
 
-                    if ratio < 0.20:
-                        logger.warning(f"⚠️ Text area too small ({ratio:.1%}). Skipping crop to keep context.")
-                        return pil_image, extracted_text
-                    
-                    if ratio > 0.90:
-                        logger.info(f"✅ Document fills page ({ratio:.1%}). Skipping crop.")
-                        return pil_image, extracted_text
-
-                    logger.info(f"✂️ Google Crop: {min_x},{min_y} -> {max_x},{max_y}")
-                    pil_image = pil_image.crop((min_x, min_y, max_x, max_y))
+                    # Не режем, если это маленький штамп (<15%) или уже скан (>85%)
+                    if 0.15 < ratio < 0.85:
+                        logger.info(f"✂️ Smart Crop: {min_x},{min_y} -> {max_x},{max_y}")
+                        pil_image = pil_image.crop((min_x, min_y, max_x, max_y))
+                    else:
+                        logger.info("✅ Skipping crop (content size is optimal)")
 
             return pil_image, extracted_text
 
