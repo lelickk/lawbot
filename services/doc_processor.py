@@ -14,7 +14,7 @@ from services.openai_client import analyze_document
 
 logger = logging.getLogger(__name__)
 
-# Если ключ не задан явно в env, используем дефолтный путь (для локального запуска)
+# Если ключ не задан явно, используем локальный файл
 if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "google_credentials.json"
 
@@ -38,7 +38,7 @@ class DocumentProcessor:
     def _google_vision_process(self, pil_image, is_retry=False):
         """
         Возвращает: (processed_image, extracted_text)
-        is_retry: Флаг, что это повторный прогон после поворота
+        is_retry: Флаг рекурсии (чтобы не зациклиться при повороте)
         """
         extracted_text = ""
         try:
@@ -54,11 +54,10 @@ class DocumentProcessor:
                 logger.error(f"Google Error: {response.error.message}")
                 return pil_image, ""
 
-            # Текст для OpenAI
             if response.full_text_annotation:
                 extracted_text = response.full_text_annotation.text
 
-            # 2. Логика ПОВОРОТА (Только в первый проход)
+            # 2. Логика ПОВОРОТА (Только первый проход)
             if not is_retry and response.full_text_annotation.pages:
                 page = response.full_text_annotation.pages[0]
                 if page.blocks:
@@ -81,10 +80,9 @@ class DocumentProcessor:
                         elif final_rotation == -90: pil_image = pil_image.rotate(-90, expand=True)
                         elif final_rotation == 180: pil_image = pil_image.rotate(180, expand=True)
                         
-                        # РЕКУРСИЯ: Запускаем анализ заново для уже повернутой картинки
                         return self._google_vision_process(pil_image, is_retry=True)
 
-            # 3. Логика ОБРЕЗКИ (Smart Cluster Crop v2)
+            # 3. Логика ОБРЕЗКИ (Smart Vertical Cluster)
             if response.full_text_annotation:
                 blocks = []
                 for page in response.full_text_annotation.pages:
@@ -100,31 +98,55 @@ class DocumentProcessor:
                 if not blocks:
                     return pil_image, extracted_text
 
-                # Находим самый большой блок (якорь)
-                blocks.sort(key=lambda x: x['area'], reverse=True)
-                main_block = blocks[0]
-                mb = main_block['box']
-                
-                final_min_x, final_min_y, final_max_x, final_max_y = mb
-                
+                # Сортируем блоки СВЕРХУ ВНИЗ (Scanline)
+                blocks.sort(key=lambda x: x['box'][1]) # Sort by min_y
+
                 w_orig, h_orig = pil_image.size
                 
-                # ПОРОГ РАЗРЫВА: 15% от высоты ВСЕГО изображения. 
-                # Это позволяет объединять разрозненные строки ID-карты.
-                threshold_gap = h_orig * 0.15 
+                # Порог разрыва: 10% от высоты изображения.
+                # Если расстояние между строками больше этого -> считаем, что начался новый объект (мусор).
+                GAP_THRESHOLD = h_orig * 0.10 
+                
+                clusters = []
+                current_cluster = {'blocks': [], 'min_y': 0, 'max_y': 0, 'area': 0}
 
-                for b in blocks[1:]:
-                    bx = b['box'] # (min_x, min_y, max_x, max_y)
-                    
-                    # Считаем вертикальный разрыв
-                    gap_bottom = bx[1] - final_max_y # Если блок ниже
-                    gap_top = final_min_y - bx[3]    # Если блок выше
-                    
-                    # Если разрыв слишком большой -> это мусор/кредитка
-                    if gap_bottom > threshold_gap or gap_top > threshold_gap:
-                        continue
-                    
-                    # Иначе расширяем границы документа
+                for b in blocks:
+                    if not current_cluster['blocks']:
+                        # Первый блок кластера
+                        current_cluster['blocks'].append(b)
+                        current_cluster['min_y'] = b['box'][1]
+                        current_cluster['max_y'] = b['box'][3]
+                        current_cluster['area'] += b['area']
+                    else:
+                        # Проверяем расстояние от низа кластера до верха текущего блока
+                        gap = b['box'][1] - current_cluster['max_y']
+                        
+                        if gap < GAP_THRESHOLD:
+                            # Блок часть документа -> объединяем
+                            current_cluster['blocks'].append(b)
+                            current_cluster['max_y'] = max(current_cluster['max_y'], b['box'][3]) # Расширяем вниз
+                            current_cluster['area'] += b['area']
+                        else:
+                            # Разрыв слишком большой -> закрываем кластер и начинаем новый
+                            clusters.append(current_cluster)
+                            current_cluster = {'blocks': [b], 'min_y': b['box'][1], 'max_y': b['box'][3], 'area': b['area']}
+                
+                # Не забываем последний кластер
+                if current_cluster['blocks']:
+                    clusters.append(current_cluster)
+
+                # Выбираем "Главный" кластер (тот, где больше всего текста по площади)
+                clusters.sort(key=lambda x: x['area'], reverse=True)
+                main_cluster = clusters[0]
+
+                # Вычисляем общие границы главного кластера
+                final_min_x = w_orig
+                final_min_y = h_orig
+                final_max_x = 0
+                final_max_y = 0
+
+                for b in main_cluster['blocks']:
+                    bx = b['box']
                     final_min_x = min(final_min_x, bx[0])
                     final_min_y = min(final_min_y, bx[1])
                     final_max_x = max(final_max_x, bx[2])
@@ -140,12 +162,12 @@ class DocumentProcessor:
                 area_crop = (final_max_x - final_min_x) * (final_max_y - final_min_y)
                 ratio = area_crop / (w_orig * h_orig)
 
-                # ПОРОГ ЧУВСТВИТЕЛЬНОСТИ: 4% (для ID на столе)
-                if ratio < 0.04:
-                    logger.warning(f"⚠️ Area too small ({ratio:.1%}). Skipping crop to keep context.")
+                # Порог чувствительности (оставляем 2% - вдруг это визитка)
+                if ratio < 0.02:
+                    logger.warning(f"⚠️ Crop area too small ({ratio:.1%}). Returning original.")
                     return pil_image, extracted_text
                 
-                logger.info(f"✂️ Smart Crop: {final_min_x},{final_min_y} -> {final_max_x},{final_max_y} (Ratio: {ratio:.1%})")
+                logger.info(f"✂️ Smart Crop (Cluster): {final_min_x},{final_min_y} -> {final_max_x},{final_max_y} (Ratio: {ratio:.1%})")
                 pil_image = pil_image.crop((final_min_x, final_min_y, final_max_x, final_max_y))
 
             return pil_image, extracted_text
@@ -180,7 +202,7 @@ class DocumentProcessor:
             temp_page_jpg = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}.jpg")
             
             try:
-                # 1. Google Vision (Rotate + Smart Cluster Crop + OCR)
+                # 1. Google Vision
                 img, ocr_text = self._google_vision_process(img)
 
                 # 2. Enhance & Save
@@ -190,9 +212,7 @@ class DocumentProcessor:
                 # 3. Classify (OpenAI Hybrid)
                 doc_data = {"doc_type": "Document", "person_name": "Unknown"}
                 
-                # Если текста много (>50 символов) -> шлем ТЕКСТ (быстро, без цензуры OpenAI на ID)
-                # Если мало (штампы) -> шлем КАРТИНКУ (надежнее для штампов)
-                
+                # Гибридный метод: Текст или Картинка
                 prompt = ""
                 image_arg = None
                 
@@ -207,7 +227,6 @@ class DocumentProcessor:
                     
                     Return JSON: {{"doc_type": "...", "person_name": "..."}}
                     """
-                    image_arg = None
                 else:
                     logger.warning("⚠️ Little text found, sending IMAGE to OpenAI")
                     image_arg = self._encode_image(temp_page_jpg)
@@ -233,7 +252,6 @@ class DocumentProcessor:
                 remote_filename = f"{date_s}_{dtype}{page_suffix}.pdf"
                 remote_path_pdf = f"{base_folder}/{remote_filename}"
 
-                # Загружаем оригинал один раз
                 if not source_file_uploaded:
                     orig_ext = os.path.splitext(local_path)[1] or ".jpg"
                     remote_orig = f"{base_folder}/Originals/{date_s}_{dtype}_Source_orig{orig_ext}"
@@ -242,7 +260,6 @@ class DocumentProcessor:
                         source_file_uploaded = True
                     except: pass
 
-                # Загружаем обработанный PDF
                 if upload_file_to_cloud(final_pdf_path, remote_path_pdf):
                     processed_results.append({
                         "status": "success", "doc_type": dtype, "person": person, 
