@@ -4,9 +4,10 @@ import requests
 import hashlib
 import hmac
 from fastapi import FastAPI, Request, BackgroundTasks
+from starlette.middleware.sessions import SessionMiddleware  # <--- ВАЖНО: Добавил импорт
 from twilio.rest import Client as TwilioClient
 from services.doc_processor import DocumentProcessor
-from services.storage import publish_file
+from services.storage import publish_file  # <--- Правильный импорт (Storage)
 from dotenv import load_dotenv
 from sqlmodel import Session, select
 from database import init_db, engine, Client, Document
@@ -19,6 +20,12 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 app = FastAPI()
+
+# --- ВАЖНО: ПОДКЛЮЧЕНИЕ СЕССИЙ ДЛЯ АДМИНКИ ---
+app.add_middleware(
+    SessionMiddleware, 
+    secret_key=os.getenv("SECRET_KEY", "super_secret_key_change_me")
+)
 
 REQUIRED_DOCS = {
     "ID_Document", "Passport", "Marriage_Certificate", "Birth_Certificate",
@@ -36,6 +43,8 @@ class AdminAuth(AuthenticationBackend):
         stored_user = os.getenv("ADMIN_USERNAME", "admin")
         stored_hash = os.getenv("ADMIN_PASSWORD_HASH")
         if not stored_hash: return False
+        
+        # Сравниваем хеши
         input_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
         if username == stored_user and hmac.compare_digest(input_hash, stored_hash):
             request.session.update({"token": "valid_token"})
@@ -93,7 +102,7 @@ def process_file_task(user_phone, media_url, media_type):
             # ТЕПЕРЬ ПОЛУЧАЕМ СПИСОК РЕЗУЛЬТАТОВ (Page 1, Page 2...)
             results_list = processor.process_and_upload(user_phone, local_path, filename)
             
-            # Если вернулась фатальная ошибка списка (например, файл битый)
+            # Если вернулась фатальная ошибка списка
             if not results_list or (len(results_list) == 1 and results_list[0].get("status") == "error"):
                  send_whatsapp_message(user_phone, f"⚠️ Ошибка: {results_list[0].get('message')}")
                  return
@@ -132,8 +141,7 @@ def process_file_task(user_phone, media_url, media_type):
             
             session.commit()
             
-            # Генерируем ссылку (на последнюю страницу или папку - пока на файл)
-            # В идеале публиковать папку, но API Диска проще публикует файл.
+            # Генерируем ссылку (публикуем последний файл для проверки)
             public_link = publish_file(last_link)
             
             # Считаем остаток
