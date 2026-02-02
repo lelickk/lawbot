@@ -34,13 +34,20 @@ class DocumentProcessor:
             logger.error(f"PDF->JPG error: {e}")
             return None
 
-    def _google_vision_process(self, pil_image, check_rotation=True):
+    def _google_vision_process(self, pil_image, check_rotation=True, recursion_depth=0):
         """
         Возвращает: (processed_image, extracted_text)
         check_rotation=True: первый проход (выравнивание).
         check_rotation=False: второй проход (обрезка).
         """
+        # Защита от бесконечной рекурсии (на всякий случай)
+        if recursion_depth > 2:
+            logger.warning("🛑 Max recursion depth reached. Returning image as is.")
+            return pil_image, ""
+
+        prefix = "🔄 [RESCAN]" if not check_rotation else "👁️ [SCAN]"
         extracted_text = ""
+
         try:
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format='JPEG')
@@ -50,50 +57,66 @@ class DocumentProcessor:
             response = self.vision_client.document_text_detection(image=image)
             
             if response.error.message:
-                logger.error(f"Google Error: {response.error.message}")
+                logger.error(f"{prefix} Google Error: {response.error.message}")
                 return pil_image, ""
 
             if response.full_text_annotation:
                 extracted_text = response.full_text_annotation.text
 
-            # --- ЛОГИКА ТОЧНОГО ПОВОРОТА (DESKEW) ---
+            # --- ЛОГИКА ТОЧНОГО ПОВОРОТА (DESKEW) - ТОЛЬКО ПЕРВЫЙ ПРОХОД ---
             if check_rotation and response.full_text_annotation.pages:
                 page = response.full_text_annotation.pages[0]
                 if page.blocks:
                     # Считаем точный угол по первому слову
                     word = page.blocks[0].paragraphs[0].words[0]
                     v = word.bounding_box.vertices
+                    # v[0]=TL, v[1]=TR. Вектор от TL к TR.
                     dx = v[1].x - v[0].x
                     dy = v[1].y - v[0].y
                     import math
+                    # atan2 возвращает угол в радианах, переводим в градусы.
+                    # Положительный угол = наклон по часовой (v1 ниже v0).
+                    # Отрицательный = наклон против часовой.
                     rotation_angle = math.degrees(math.atan2(dy, dx))
                     
                     # Если угол значительный (> 0.5 градуса), выравниваем
-                    # PIL вращает против часовой, поэтому используем -rotation_angle
                     if abs(rotation_angle) > 0.5:
-                        logger.info(f"📐 Deskewing image by {-rotation_angle:.2f} degrees (Detected: {rotation_angle:.2f})")
+                        # FIX: PIL вращает против часовой.
+                        # Если наклон detected +20 (по часовой), нам надо повернуть на +20 (против часовой), чтобы исправить.
+                        # Если наклон detected -20 (против часовой), нам надо повернуть на -20 (по часовой).
+                        # Значит, используем rotation_angle как есть, БЕЗ минуса.
+                        logger.info(f"📐 Deskewing image by {rotation_angle:.2f} degrees (Detected: {rotation_angle:.2f})")
                         
-                        # fillcolor='white' чтобы углы после поворота были белыми, а не черными
-                        pil_image = pil_image.rotate(-rotation_angle, expand=True, resample=Image.BICUBIC, fillcolor='white')
+                        # fillcolor='white' чтобы углы были белыми
+                        # УБРАЛ МИНУС ПЕРЕД rotation_angle
+                        pil_image = pil_image.rotate(rotation_angle, expand=True, resample=Image.BICUBIC, fillcolor='white')
                         
                         # ВАЖНО: Рекурсивный вызов для обрезки уже ровного фото
-                        logger.info("🔄 Image rotated. Re-scanning for precise crop...")
-                        return self._google_vision_process(pil_image, check_rotation=False)
+                        logger.info("🔄 Image rotated. Starting recursive re-scan for crop...")
+                        return self._google_vision_process(pil_image, check_rotation=False, recursion_depth=recursion_depth+1)
 
-            # --- ЛОГИКА ОБРЕЗКИ (CROP) ---
+            # --- ЛОГИКА ОБРЕЗКИ (CROP) - ВЫПОЛНЯЕТСЯ ВО ВТОРОМ ПРОХОДЕ (или если поворот не нужен) ---
             if response.full_text_annotation:
                 min_x, min_y = 10000, 10000
                 max_x, max_y = 0, 0
                 
+                found_box = False
                 for page in response.full_text_annotation.pages:
                     for block in page.blocks:
                         v = block.bounding_box.vertices
-                        for point in v:
-                            min_x = min(min_x, point.x)
-                            min_y = min(min_y, point.y)
-                            max_x = max(max_x, point.x)
-                            max_y = max(max_y, point.y)
+                        # Проверяем, что Гугл вернул все 4 вершины
+                        if len(v) == 4:
+                            found_box = True
+                            for point in v:
+                                min_x = min(min_x, point.x)
+                                min_y = min(min_y, point.y)
+                                max_x = max(max_x, point.x)
+                                max_y = max(max_y, point.y)
                 
+                if not found_box:
+                     logger.warning(f"{prefix} No valid bounding boxes found for cropping.")
+                     return pil_image, extracted_text
+
                 # Добавляем небольшие поля
                 pad = 20
                 w_orig, h_orig = pil_image.size
@@ -107,15 +130,22 @@ class DocumentProcessor:
                 
                 if area_total > 0:
                     ratio = area_crop / area_total
-                    logger.info(f"📊 Text Coverage: {ratio:.1%}")
+                    logger.info(f"{prefix} 📊 Text Coverage: {ratio:.1%}")
 
                     # Не режем, если это маленький штамп (<15%) или уже скан (>85%)
                     if 0.15 < ratio < 0.85:
-                        logger.info(f"✂️ Smart Crop: {min_x},{min_y} -> {max_x},{max_y}")
+                        logger.info(f"{prefix} ✂️ Smart Crop: {min_x},{min_y} -> {max_x},{max_y}")
                         pil_image = pil_image.crop((min_x, min_y, max_x, max_y))
                     else:
-                        logger.info("✅ Skipping crop (content size is optimal)")
+                        logger.info(f"{prefix} ✅ Skipping crop (content size is optimal)")
+                else:
+                     logger.warning(f"{prefix} Cannot calculate crop ratio (area=0).")
 
+
+            return pil_image, extracted_text
+
+        except Exception as e:
+            logger.error(f"{prefix} Google Vision Error: {e}")
             return pil_image, extracted_text
 
         except Exception as e:
