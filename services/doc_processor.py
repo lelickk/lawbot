@@ -34,118 +34,120 @@ class DocumentProcessor:
             logger.error(f"PDF->JPG error: {e}")
             return None
 
-    def _google_vision_process(self, pil_image, check_rotation=True, recursion_depth=0):
+    def _google_vision_process(self, pil_image, is_retry=False):
         """
         Возвращает: (processed_image, extracted_text)
-        check_rotation=True: первый проход (выравнивание).
-        check_rotation=False: второй проход (обрезка).
+        is_retry: Флаг, что это повторный прогон после поворота
         """
-        # Защита от бесконечной рекурсии (на всякий случай)
-        if recursion_depth > 2:
-            logger.warning("🛑 Max recursion depth reached. Returning image as is.")
-            return pil_image, ""
-
-        prefix = "🔄 [RESCAN]" if not check_rotation else "👁️ [SCAN]"
         extracted_text = ""
-
         try:
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format='JPEG')
             content = img_byte_arr.getvalue()
             image = vision.Image(content=content)
             
+            # 1. ЗАПРОС К GOOGLE
             response = self.vision_client.document_text_detection(image=image)
             
             if response.error.message:
-                logger.error(f"{prefix} Google Error: {response.error.message}")
+                logger.error(f"Google Error: {response.error.message}")
                 return pil_image, ""
 
+            # Текст для OpenAI
             if response.full_text_annotation:
                 extracted_text = response.full_text_annotation.text
 
-            # --- ЛОГИКА ТОЧНОГО ПОВОРОТА (DESKEW) - ТОЛЬКО ПЕРВЫЙ ПРОХОД ---
-            if check_rotation and response.full_text_annotation.pages:
+            # 2. Логика ПОВОРОТА (Только в первый проход)
+            if not is_retry and response.full_text_annotation.pages:
                 page = response.full_text_annotation.pages[0]
                 if page.blocks:
-                    # Считаем точный угол по первому слову
+                    # Считаем угол по первому слову
                     word = page.blocks[0].paragraphs[0].words[0]
                     v = word.bounding_box.vertices
-                    # v[0]=TL, v[1]=TR. Вектор от TL к TR.
                     dx = v[1].x - v[0].x
                     dy = v[1].y - v[0].y
                     import math
-                    # atan2 возвращает угол в радианах, переводим в градусы.
-                    # Положительный угол = наклон по часовой (v1 ниже v0).
-                    # Отрицательный = наклон против часовой.
                     rotation_angle = math.degrees(math.atan2(dy, dx))
                     
-                    # Если угол значительный (> 0.5 градуса), выравниваем
-                    if abs(rotation_angle) > 0.5:
-                        # FIX: PIL вращает против часовой.
-                        # Если наклон detected +20 (по часовой), нам надо повернуть на +20 (против часовой), чтобы исправить.
-                        # Если наклон detected -20 (против часовой), нам надо повернуть на -20 (по часовой).
-                        # Значит, используем rotation_angle как есть, БЕЗ минуса.
-                        logger.info(f"📐 Deskewing image by {rotation_angle:.2f} degrees (Detected: {rotation_angle:.2f})")
+                    final_rotation = 0
+                    if 45 <= rotation_angle < 135: final_rotation = 90
+                    elif -135 < rotation_angle <= -45: final_rotation = -90
+                    elif rotation_angle >= 135 or rotation_angle <= -135: final_rotation = 180
+                    
+                    if final_rotation != 0:
+                        logger.info(f"🔄 Rotation needed: {final_rotation} (Detected: {rotation_angle:.2f})")
+                        if final_rotation == 90: pil_image = pil_image.rotate(90, expand=True)
+                        elif final_rotation == -90: pil_image = pil_image.rotate(-90, expand=True)
+                        elif final_rotation == 180: pil_image = pil_image.rotate(180, expand=True)
                         
-                        # fillcolor='white' чтобы углы были белыми
-                        # УБРАЛ МИНУС ПЕРЕД rotation_angle
-                        pil_image = pil_image.rotate(rotation_angle, expand=True, resample=Image.BICUBIC, fillcolor='white')
-                        
-                        # ВАЖНО: Рекурсивный вызов для обрезки уже ровного фото
-                        logger.info("🔄 Image rotated. Starting recursive re-scan for crop...")
-                        return self._google_vision_process(pil_image, check_rotation=False, recursion_depth=recursion_depth+1)
+                        # РЕКУРСИЯ: Запускаем анализ заново для уже повернутой картинки, 
+                        # чтобы получить правильные координаты для кропа.
+                        return self._google_vision_process(pil_image, is_retry=True)
 
-            # --- ЛОГИКА ОБРЕЗКИ (CROP) - ВЫПОЛНЯЕТСЯ ВО ВТОРОМ ПРОХОДЕ (или если поворот не нужен) ---
+            # 3. Логика ОБРЕЗКИ (Smart Cluster Crop)
             if response.full_text_annotation:
-                min_x, min_y = 10000, 10000
-                max_x, max_y = 0, 0
-                
-                found_box = False
+                # Собираем все блоки
+                blocks = []
                 for page in response.full_text_annotation.pages:
                     for block in page.blocks:
                         v = block.bounding_box.vertices
-                        # Проверяем, что Гугл вернул все 4 вершины
-                        if len(v) == 4:
-                            found_box = True
-                            for point in v:
-                                min_x = min(min_x, point.x)
-                                min_y = min(min_y, point.y)
-                                max_x = max(max_x, point.x)
-                                max_y = max(max_y, point.y)
-                
-                if not found_box:
-                     logger.warning(f"{prefix} No valid bounding boxes found for cropping.")
-                     return pil_image, extracted_text
+                        min_x = min(p.x for p in v)
+                        min_y = min(p.y for p in v)
+                        max_x = max(p.x for p in v)
+                        max_y = max(p.y for p in v)
+                        area = (max_x - min_x) * (max_y - min_y)
+                        blocks.append({'box': (min_x, min_y, max_x, max_y), 'area': area})
 
-                # Добавляем небольшие поля
+                if not blocks:
+                    return pil_image, extracted_text
+
+                # Находим самый большой блок (тело документа)
+                blocks.sort(key=lambda x: x['area'], reverse=True)
+                main_block = blocks[0]
+                mb = main_block['box'] # (x1, y1, x2, y2)
+                
+                # Формируем итоговые границы, начиная с главного блока
+                final_min_x, final_min_y, final_max_x, final_max_y = mb
+
+                # Добавляем другие блоки, ТОЛЬКО если они близко к главному (защита от кредиток внизу)
+                doc_height = mb[3] - mb[1]
+                threshold_y = doc_height * 0.3 # Допускаем разрыв не более 30% от высоты документа
+
+                for b in blocks[1:]:
+                    bx = b['box']
+                    # Проверяем вертикальное расстояние до главного блока
+                    dist_to_bottom = bx[1] - final_max_y # Если блок ниже
+                    dist_to_top = final_min_y - bx[3]    # Если блок выше
+                    
+                    # Если блок слишком далеко - это мусор (кредитка, клавиатура), игнорируем
+                    if dist_to_bottom > threshold_y or dist_to_top > threshold_y:
+                        continue
+                    
+                    # Иначе расширяем границы
+                    final_min_x = min(final_min_x, bx[0])
+                    final_min_y = min(final_min_y, bx[1])
+                    final_max_x = max(final_max_x, bx[2])
+                    final_max_y = max(final_max_y, bx[3])
+
+                # Паддинг
                 pad = 20
                 w_orig, h_orig = pil_image.size
-                min_x = max(0, min_x - pad)
-                min_y = max(0, min_y - pad)
-                max_x = min(w_orig, max_x + pad)
-                max_y = min(h_orig, max_y + pad)
+                final_min_x = max(0, final_min_x - pad)
+                final_min_y = max(0, final_min_y - pad)
+                final_max_x = min(w_orig, final_max_x + pad)
+                final_max_y = min(h_orig, final_max_y + pad)
 
-                area_crop = (max_x - min_x) * (max_y - min_y)
-                area_total = w_orig * h_orig
+                # Проверка размера (как раньше)
+                area_crop = (final_max_x - final_min_x) * (final_max_y - final_min_y)
+                ratio = area_crop / (w_orig * h_orig)
+
+                if ratio < 0.15:
+                    logger.warning(f"⚠️ Area too small ({ratio:.1%}). Skipping crop.")
+                    return pil_image, extracted_text
                 
-                if area_total > 0:
-                    ratio = area_crop / area_total
-                    logger.info(f"{prefix} 📊 Text Coverage: {ratio:.1%}")
+                logger.info(f"✂️ Smart Crop: {final_min_x},{final_min_y} -> {final_max_x},{final_max_y}")
+                pil_image = pil_image.crop((final_min_x, final_min_y, final_max_x, final_max_y))
 
-                    # Не режем, если это маленький штамп (<15%) или уже скан (>85%)
-                    if 0.15 < ratio < 0.85:
-                        logger.info(f"{prefix} ✂️ Smart Crop: {min_x},{min_y} -> {max_x},{max_y}")
-                        pil_image = pil_image.crop((min_x, min_y, max_x, max_y))
-                    else:
-                        logger.info(f"{prefix} ✅ Skipping crop (content size is optimal)")
-                else:
-                     logger.warning(f"{prefix} Cannot calculate crop ratio (area=0).")
-
-
-            return pil_image, extracted_text
-
-        except Exception as e:
-            logger.error(f"{prefix} Google Vision Error: {e}")
             return pil_image, extracted_text
 
         except Exception as e:
