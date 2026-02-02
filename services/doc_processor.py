@@ -80,13 +80,10 @@ class DocumentProcessor:
                         elif final_rotation == -90: pil_image = pil_image.rotate(-90, expand=True)
                         elif final_rotation == 180: pil_image = pil_image.rotate(180, expand=True)
                         
-                        # РЕКУРСИЯ: Запускаем анализ заново для уже повернутой картинки, 
-                        # чтобы получить правильные координаты для кропа.
                         return self._google_vision_process(pil_image, is_retry=True)
 
             # 3. Логика ОБРЕЗКИ (Smart Cluster Crop)
             if response.full_text_annotation:
-                # Собираем все блоки
                 blocks = []
                 for page in response.full_text_annotation.pages:
                     for block in page.blocks:
@@ -101,51 +98,46 @@ class DocumentProcessor:
                 if not blocks:
                     return pil_image, extracted_text
 
-                # Находим самый большой блок (тело документа)
+                # Находим самый большой блок
                 blocks.sort(key=lambda x: x['area'], reverse=True)
                 main_block = blocks[0]
-                mb = main_block['box'] # (x1, y1, x2, y2)
+                mb = main_block['box']
                 
-                # Формируем итоговые границы, начиная с главного блока
                 final_min_x, final_min_y, final_max_x, final_max_y = mb
 
-                # Добавляем другие блоки, ТОЛЬКО если они близко к главному (защита от кредиток внизу)
                 doc_height = mb[3] - mb[1]
-                threshold_y = doc_height * 0.3 # Допускаем разрыв не более 30% от высоты документа
+                threshold_y = doc_height * 0.4 # Чуть увеличил допуск (40%) для разбросанных строк ID
 
                 for b in blocks[1:]:
                     bx = b['box']
-                    # Проверяем вертикальное расстояние до главного блока
-                    dist_to_bottom = bx[1] - final_max_y # Если блок ниже
-                    dist_to_top = final_min_y - bx[3]    # Если блок выше
+                    dist_to_bottom = bx[1] - final_max_y
+                    dist_to_top = final_min_y - bx[3]
                     
-                    # Если блок слишком далеко - это мусор (кредитка, клавиатура), игнорируем
                     if dist_to_bottom > threshold_y or dist_to_top > threshold_y:
                         continue
                     
-                    # Иначе расширяем границы
                     final_min_x = min(final_min_x, bx[0])
                     final_min_y = min(final_min_y, bx[1])
                     final_max_x = max(final_max_x, bx[2])
                     final_max_y = max(final_max_y, bx[3])
 
-                # Паддинг
-                pad = 20
+                pad = 15 # Чуть уменьшил паддинг, чтобы было аккуратнее
                 w_orig, h_orig = pil_image.size
                 final_min_x = max(0, final_min_x - pad)
                 final_min_y = max(0, final_min_y - pad)
                 final_max_x = min(w_orig, final_max_x + pad)
                 final_max_y = min(h_orig, final_max_y + pad)
 
-                # Проверка размера (как раньше)
                 area_crop = (final_max_x - final_min_x) * (final_max_y - final_min_y)
                 ratio = area_crop / (w_orig * h_orig)
 
-                if ratio < 0.15:
+                # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+                # Было 0.15, ставим 0.04 (4%), чтобы ловить ID-карты на столе
+                if ratio < 0.04:
                     logger.warning(f"⚠️ Area too small ({ratio:.1%}). Skipping crop.")
                     return pil_image, extracted_text
                 
-                logger.info(f"✂️ Smart Crop: {final_min_x},{final_min_y} -> {final_max_x},{final_max_y}")
+                logger.info(f"✂️ Smart Crop: {final_min_x},{final_min_y} -> {final_max_x},{final_max_y} (Ratio: {ratio:.1%})")
                 pil_image = pil_image.crop((final_min_x, final_min_y, final_max_x, final_max_y))
 
             return pil_image, extracted_text
