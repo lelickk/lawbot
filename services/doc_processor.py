@@ -34,9 +34,11 @@ class DocumentProcessor:
             logger.error(f"PDF->JPG error: {e}")
             return None
 
-    def _google_vision_process(self, pil_image):
+    def _google_vision_process(self, pil_image, check_rotation=True):
         """
         Возвращает: (processed_image, extracted_text)
+        check_rotation=True: проверяем угол и вращаем.
+        check_rotation=False: только кропаем (второй проход).
         """
         extracted_text = ""
         try:
@@ -53,15 +55,14 @@ class DocumentProcessor:
                 logger.error(f"Google Error: {response.error.message}")
                 return pil_image, ""
 
-            # 1. Забираем полный текст
+            # 1. Забираем текст
             if response.full_text_annotation:
                 extracted_text = response.full_text_annotation.text
 
-            # 2. Логика поворота (Text Orientation)
-            if response.full_text_annotation.pages:
+            # 2. Логика поворота (Только в первом проходе)
+            if check_rotation and response.full_text_annotation.pages:
                 page = response.full_text_annotation.pages[0]
                 if page.blocks:
-                    # Считаем угол по первому слову
                     word = page.blocks[0].paragraphs[0].words[0]
                     v = word.bounding_box.vertices
                     dx = v[1].x - v[0].x
@@ -69,7 +70,6 @@ class DocumentProcessor:
                     import math
                     rotation_angle = math.degrees(math.atan2(dy, dx))
                     
-                    # Нормализуем угол
                     final_rotation = 0
                     if 45 <= rotation_angle < 135: final_rotation = 90
                     elif -135 < rotation_angle <= -45: final_rotation = -90
@@ -80,16 +80,18 @@ class DocumentProcessor:
                         if final_rotation == 90: pil_image = pil_image.rotate(90, expand=True)
                         elif final_rotation == -90: pil_image = pil_image.rotate(-90, expand=True)
                         elif final_rotation == 180: pil_image = pil_image.rotate(180, expand=True)
-                        # Если повернули, координаты старого ответа Google уже не валидны для кропа.
-                        # Возвращаем повернутый оригинал.
-                        return pil_image, extracted_text
+                        
+                        # --- RE-SCAN TRICK ---
+                        # Мы повернули фото. Координаты Гугла теперь неверны.
+                        # Запускаем анализ заново для повернутого фото, но запрещаем вращать снова.
+                        logger.info("🔄 Image rotated. Re-scanning for precise crop...")
+                        return self._google_vision_process(pil_image, check_rotation=False)
 
             # 3. Логика обрезки (Crop)
             if response.full_text_annotation:
                 min_x, min_y = 10000, 10000
                 max_x, max_y = 0, 0
                 
-                # Находим границы всего текста
                 for page in response.full_text_annotation.pages:
                     for block in page.blocks:
                         v = block.bounding_box.vertices
@@ -99,7 +101,6 @@ class DocumentProcessor:
                             max_x = max(max_x, point.x)
                             max_y = max(max_y, point.y)
                 
-                # Добавляем отступы
                 pad = 30
                 w_orig, h_orig = pil_image.size
                 min_x = max(0, min_x - pad)
@@ -107,26 +108,24 @@ class DocumentProcessor:
                 max_x = min(w_orig, max_x + pad)
                 max_y = min(h_orig, max_y + pad)
 
-                # --- ВАЖНАЯ ПРОВЕРКА РАЗМЕРА ---
                 area_crop = (max_x - min_x) * (max_y - min_y)
                 area_total = w_orig * h_orig
-                ratio = area_crop / area_total
+                
+                # Защита от деления на ноль, если картинка пустая
+                if area_total > 0:
+                    ratio = area_crop / area_total
+                    logger.info(f"📐 Text Coverage: {ratio:.1%}")
 
-                logger.info(f"📐 Text Coverage: {ratio:.1%}")
+                    if ratio < 0.20:
+                        logger.warning(f"⚠️ Text area too small ({ratio:.1%}). Skipping crop to keep context.")
+                        return pil_image, extracted_text
+                    
+                    if ratio > 0.90:
+                        logger.info(f"✅ Document fills page ({ratio:.1%}). Skipping crop.")
+                        return pil_image, extracted_text
 
-                # Если текст занимает меньше 20% страницы (это штамп на пустом листе)
-                if ratio < 0.20:
-                    logger.warning(f"⚠️ Text area too small ({ratio:.1%}). Skipping crop to keep context.")
-                    return pil_image, extracted_text # Возвращаем ПОЛНЫЙ лист
-
-                # Если текст занимает почти весь лист (это скан)
-                if ratio > 0.90:
-                     logger.info(f"✅ Document fills page ({ratio:.1%}). Skipping crop.")
-                     return pil_image, extracted_text
-
-                # Иначе - режем (это паспорт на столе)
-                logger.info(f"✂️ Google Crop: {min_x},{min_y} -> {max_x},{max_y}")
-                pil_image = pil_image.crop((min_x, min_y, max_x, max_y))
+                    logger.info(f"✂️ Google Crop: {min_x},{min_y} -> {max_x},{max_y}")
+                    pil_image = pil_image.crop((min_x, min_y, max_x, max_y))
 
             return pil_image, extracted_text
 
