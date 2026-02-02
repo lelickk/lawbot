@@ -36,9 +36,9 @@ class DocumentProcessor:
 
     def _google_vision_process(self, pil_image, is_retry=False):
         """
-        Универсальная обработка: 
-        1. Исправление угла (Rotation).
-        2. Умная обрезка (Smart Crop) с приоритетом сохранения данных.
+        Финальная версия для Демо:
+        1. Поворот (Rotation).
+        2. Безопасная обрезка (Safe Crop): если документ занимает < 20% кадра, отдаем оригинал.
         """
         extracted_text = ""
         try:
@@ -47,7 +47,7 @@ class DocumentProcessor:
             content = img_byte_arr.getvalue()
             image = vision.Image(content=content)
             
-            # --- 1. GOOGLE VISION REQUEST ---
+            # --- 1. GOOGLE VISION ---
             response = self.vision_client.document_text_detection(image=image)
             
             if response.error.message:
@@ -57,7 +57,7 @@ class DocumentProcessor:
             if response.full_text_annotation:
                 extracted_text = response.full_text_annotation.text
 
-            # --- 2. ROTATION (Только первый проход) ---
+            # --- 2. ROTATION ---
             if not is_retry and response.full_text_annotation.pages:
                 page = response.full_text_annotation.pages[0]
                 if page.blocks:
@@ -78,10 +78,9 @@ class DocumentProcessor:
                         if final_rotation == 90: pil_image = pil_image.rotate(90, expand=True)
                         elif final_rotation == -90: pil_image = pil_image.rotate(-90, expand=True)
                         elif final_rotation == 180: pil_image = pil_image.rotate(180, expand=True)
-                        # Рекурсия с уже повернутым изображением
                         return self._google_vision_process(pil_image, is_retry=True)
 
-            # --- 3. SMART CROP (Aggressive Universal) ---
+            # --- 3. SAFE CROP (Aggressive Union) ---
             if response.full_text_annotation:
                 blocks = []
                 for page in response.full_text_annotation.pages:
@@ -96,57 +95,40 @@ class DocumentProcessor:
                 if not blocks:
                     return pil_image, extracted_text
 
-                # Сортировка сверху вниз
-                blocks.sort(key=lambda x: x['box'][1])
-
+                # Вместо кластеров просто ищем крайние точки ВСЕГО текста на странице
                 w_orig, h_orig = pil_image.size
                 
-                # GAP_THRESHOLD = 20% от высоты. 
-                # Это позволяет склеивать шапку и подвал А4, а также строки ID.
-                GAP_THRESHOLD = h_orig * 0.20 
-                
-                clusters = []
-                if blocks:
-                    b = blocks[0]['box']
-                    current_cluster = {'min_x': b[0], 'min_y': b[1], 'max_x': b[2], 'max_y': b[3]}
-                
-                    for b in blocks[1:]:
-                        box = b['box']
-                        gap = box[1] - current_cluster['max_y']
-                        
-                        if gap < GAP_THRESHOLD:
-                            # Объединяем
-                            current_cluster['min_x'] = min(current_cluster['min_x'], box[0])
-                            current_cluster['max_y'] = max(current_cluster['max_y'], box[3])
-                            current_cluster['max_x'] = max(current_cluster['max_x'], box[2])
-                        else:
-                            clusters.append(current_cluster)
-                            current_cluster = {'min_x': box[0], 'min_y': box[1], 'max_x': box[2], 'max_y': box[3]}
-                    clusters.append(current_cluster)
+                final_min_x = w_orig
+                final_min_y = h_orig
+                final_max_x = 0
+                final_max_y = 0
 
-                # Выбор кластера по МАКСИМАЛЬНОЙ ПЛОЩАДИ (приоритет тела документа)
-                def get_cluster_area(c):
-                    return (c['max_x'] - c['min_x']) * (c['max_y'] - c['min_y'])
+                for b in blocks:
+                    box = b['box']
+                    final_min_x = min(final_min_x, box[0])
+                    final_min_y = min(final_min_y, box[1])
+                    final_max_x = max(final_max_x, box[2])
+                    final_max_y = max(final_max_y, box[3])
 
-                clusters.sort(key=get_cluster_area, reverse=True)
-                best_cluster = clusters[0]
-
-                # Паддинг 20px
-                final_min_x = max(0, best_cluster['min_x'] - 20)
-                final_min_y = max(0, best_cluster['min_y'] - 20)
-                final_max_x = min(w_orig, best_cluster['max_x'] + 20)
-                final_max_y = min(h_orig, best_cluster['max_y'] + 20)
+                # Добавляем отступы (Padding)
+                pad = 30
+                final_min_x = max(0, final_min_x - pad)
+                final_min_y = max(0, final_min_y - pad)
+                final_max_x = min(w_orig, final_max_x + pad)
+                final_max_y = min(h_orig, final_max_y + pad)
 
                 area_crop = (final_max_x - final_min_x) * (final_max_y - final_min_y)
                 ratio = area_crop / (w_orig * h_orig)
 
-                # SAFETY CHECK: Если кроп слишком мелкий (<4%), значит что-то пошло не так.
-                # Лучше вернуть оригинал, чем вырезать марку.
-                if ratio < 0.04:
-                    logger.warning(f"⚠️ Crop too small ({ratio:.1%}). Returning ORIGINAL image.")
+                # --- ГЛАВНАЯ ЗАЩИТА ДЛЯ ДЕМО ---
+                # Если обрезанная часть составляет менее 15% от всего фото,
+                # значит мы скорее всего вырезали только кусок текста, а не документ.
+                # В таком случае ОТМЕНЯЕМ кроп и отдаем полный кадр.
+                if ratio < 0.15:
+                    logger.warning(f"🛡️ SAFE CROP: Detected small area ({ratio:.1%}). Returning FULL IMAGE to be safe.")
                     return pil_image, extracted_text
                 
-                logger.info(f"✂️ Smart Crop Applied: Ratio {ratio:.1%}")
+                logger.info(f"✂️ SAFE CROP: Applied. Ratio {ratio:.1%}")
                 pil_image = pil_image.crop((final_min_x, final_min_y, final_max_x, final_max_y))
 
             return pil_image, extracted_text
@@ -180,8 +162,6 @@ class DocumentProcessor:
 
         for i, img in enumerate(pil_images, start=1):
             page_suffix = f"_page{i}"
-            # Если это PDF, имя файла будет содержать номер страницы
-            # Если это одно фото, номер все равно добавится (не страшно)
             temp_page_jpg = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}.jpg")
             
             try:
