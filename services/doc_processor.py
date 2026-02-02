@@ -14,6 +14,7 @@ from services.openai_client import analyze_document
 
 logger = logging.getLogger(__name__)
 
+# Если ключ не задан явно в env, используем дефолтный путь (для локального запуска)
 if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "google_credentials.json"
 
@@ -80,9 +81,10 @@ class DocumentProcessor:
                         elif final_rotation == -90: pil_image = pil_image.rotate(-90, expand=True)
                         elif final_rotation == 180: pil_image = pil_image.rotate(180, expand=True)
                         
+                        # РЕКУРСИЯ: Запускаем анализ заново для уже повернутой картинки
                         return self._google_vision_process(pil_image, is_retry=True)
 
-            # 3. Логика ОБРЕЗКИ (Smart Cluster Crop)
+            # 3. Логика ОБРЕЗКИ (Smart Cluster Crop v2)
             if response.full_text_annotation:
                 blocks = []
                 for page in response.full_text_annotation.pages:
@@ -98,31 +100,38 @@ class DocumentProcessor:
                 if not blocks:
                     return pil_image, extracted_text
 
-                # Находим самый большой блок
+                # Находим самый большой блок (якорь)
                 blocks.sort(key=lambda x: x['area'], reverse=True)
                 main_block = blocks[0]
                 mb = main_block['box']
                 
                 final_min_x, final_min_y, final_max_x, final_max_y = mb
-
-                doc_height = mb[3] - mb[1]
-                threshold_y = doc_height * 0.4 # Чуть увеличил допуск (40%) для разбросанных строк ID
+                
+                w_orig, h_orig = pil_image.size
+                
+                # ПОРОГ РАЗРЫВА: 15% от высоты ВСЕГО изображения. 
+                # Это позволяет объединять разрозненные строки ID-карты.
+                threshold_gap = h_orig * 0.15 
 
                 for b in blocks[1:]:
-                    bx = b['box']
-                    dist_to_bottom = bx[1] - final_max_y
-                    dist_to_top = final_min_y - bx[3]
+                    bx = b['box'] # (min_x, min_y, max_x, max_y)
                     
-                    if dist_to_bottom > threshold_y or dist_to_top > threshold_y:
+                    # Считаем вертикальный разрыв
+                    gap_bottom = bx[1] - final_max_y # Если блок ниже
+                    gap_top = final_min_y - bx[3]    # Если блок выше
+                    
+                    # Если разрыв слишком большой -> это мусор/кредитка
+                    if gap_bottom > threshold_gap or gap_top > threshold_gap:
                         continue
                     
+                    # Иначе расширяем границы документа
                     final_min_x = min(final_min_x, bx[0])
                     final_min_y = min(final_min_y, bx[1])
                     final_max_x = max(final_max_x, bx[2])
                     final_max_y = max(final_max_y, bx[3])
 
-                pad = 15 # Чуть уменьшил паддинг, чтобы было аккуратнее
-                w_orig, h_orig = pil_image.size
+                # Паддинг
+                pad = 20
                 final_min_x = max(0, final_min_x - pad)
                 final_min_y = max(0, final_min_y - pad)
                 final_max_x = min(w_orig, final_max_x + pad)
@@ -131,10 +140,9 @@ class DocumentProcessor:
                 area_crop = (final_max_x - final_min_x) * (final_max_y - final_min_y)
                 ratio = area_crop / (w_orig * h_orig)
 
-                # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
-                # Было 0.15, ставим 0.04 (4%), чтобы ловить ID-карты на столе
+                # ПОРОГ ЧУВСТВИТЕЛЬНОСТИ: 4% (для ID на столе)
                 if ratio < 0.04:
-                    logger.warning(f"⚠️ Area too small ({ratio:.1%}). Skipping crop.")
+                    logger.warning(f"⚠️ Area too small ({ratio:.1%}). Skipping crop to keep context.")
                     return pil_image, extracted_text
                 
                 logger.info(f"✂️ Smart Crop: {final_min_x},{final_min_y} -> {final_max_x},{final_max_y} (Ratio: {ratio:.1%})")
@@ -172,42 +180,34 @@ class DocumentProcessor:
             temp_page_jpg = os.path.join(self.temp_dir, f"temp_{user_phone}_p{i}.jpg")
             
             try:
-                # 1. Google Vision
+                # 1. Google Vision (Rotate + Smart Cluster Crop + OCR)
                 img, ocr_text = self._google_vision_process(img)
 
                 # 2. Enhance & Save
                 img = self._enhance_image(img)
                 img.save(temp_page_jpg, "JPEG", quality=90)
                 
-                # 3. Classify (OpenAI) - ГИБРИДНЫЙ МЕТОД
+                # 3. Classify (OpenAI Hybrid)
                 doc_data = {"doc_type": "Document", "person_name": "Unknown"}
                 
-                # Если OCR текста много (>50 символов) -> шлем текст (быстро, без цензуры)
+                # Если текста много (>50 символов) -> шлем ТЕКСТ (быстро, без цензуры OpenAI на ID)
                 # Если мало (штампы) -> шлем КАРТИНКУ (надежнее для штампов)
                 
                 prompt = ""
                 image_arg = None
-                            
+                
                 if ocr_text and len(ocr_text) > 50:
                     logger.info("🚀 Sending OCR Text to OpenAI")
-                    # ИЗМЕНЕННЫЙ ПРОМПТ: Более технический, чтобы обойти Safety Filter
                     prompt = f"""
-                    Act as a Data Extraction API. Your task is to extract structured data from OCR text for an internal filing system.
-                    
-                    OCR TEXT:
+                    Analyze this extracted text from a document page:
                     '''{ocr_text[:3000]}''' 
                     
-                    INSTRUCTIONS:
-                    1. Identify the Document Type (e.g., Israeli_ID, Passport, Marriage_Certificate).
-                    2. Extract the Full Name of the document holder. 
-                       - Convert Hebrew names to Latin (English) characters.
-                       - Example: "ישראל ישראלי" -> "Israel_Israeli".
-                       - Ignore labels like "Name", "Surname". Just return the value.
+                    1. Classify Type: ID_Document, Passport, Birth_Certificate, Marriage_Certificate, Divorce_Certificate, etc.
+                    2. Extract Full Name (Latin). Look for "Name", "Given Name", or transliterated names.
                     
-                    OUTPUT JSON ONLY:
-                    {{"doc_type": "...", "person_name": "..."}}
+                    Return JSON: {{"doc_type": "...", "person_name": "..."}}
                     """
-                    image_arg = None    
+                    image_arg = None
                 else:
                     logger.warning("⚠️ Little text found, sending IMAGE to OpenAI")
                     image_arg = self._encode_image(temp_page_jpg)
@@ -233,6 +233,7 @@ class DocumentProcessor:
                 remote_filename = f"{date_s}_{dtype}{page_suffix}.pdf"
                 remote_path_pdf = f"{base_folder}/{remote_filename}"
 
+                # Загружаем оригинал один раз
                 if not source_file_uploaded:
                     orig_ext = os.path.splitext(local_path)[1] or ".jpg"
                     remote_orig = f"{base_folder}/Originals/{date_s}_{dtype}_Source_orig{orig_ext}"
@@ -241,6 +242,7 @@ class DocumentProcessor:
                         source_file_uploaded = True
                     except: pass
 
+                # Загружаем обработанный PDF
                 if upload_file_to_cloud(final_pdf_path, remote_path_pdf):
                     processed_results.append({
                         "status": "success", "doc_type": dtype, "person": person, 
